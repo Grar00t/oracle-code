@@ -1,0 +1,20 @@
+{
+  "name": "oracle-code",
+  "version": "0.1.0",
+  "description": "Local-first terminal coding agent: zero-alloc packed-cell TUI, Arabic-correct grid, JSONL sessions, lazy MCP schemas.",
+  "type": "module",
+  "bin": { "oc": "./src/index.ts" },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build --compile --minify src/index.ts --outfile dist/oc",
+    "test": "bun test",
+    "bench": "bun run bench/frame.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  },
+  "engines": { "bun": ">=1.1.0" }
+}

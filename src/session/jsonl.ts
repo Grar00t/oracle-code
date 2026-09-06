@@ -6,9 +6,12 @@
 // Addition: payloads above a threshold are content-addressed into a blob store
 // and referenced by hash. The transcript stays small enough to inspect with jq
 // even after a session reads a 200k-line file, and replay is still exact.
+//
+// Runtime-agnostic: hashing, ids and file access go through src/rt.
 
-import { appendFile, mkdir, readdir } from "node:fs/promises"
+import { readdir } from "node:fs/promises"
 import { join, resolve } from "node:path"
+import { appendText, exists, readText, sha256hex, uuid, writeText } from "../rt/index"
 
 export type RecordKind =
 	| "session.start"
@@ -32,6 +35,16 @@ export type SessionRecord = {
 
 const INLINE_LIMIT = 4096
 
+/** Session ids become path components, so they must be legal on Windows too. */
+export function sessionIdFor(now = new Date(), token = uuid()): string {
+	return `${now.toISOString().replace(/[:.]/g, "-")}-${token.replace(/-/g, "").slice(0, 8)}`
+}
+
+/** Turn an absolute working directory into one safe path component. */
+export function projectKey(cwd = process.cwd()): string {
+	return resolve(cwd).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+}
+
 export class Session {
 	readonly id: string
 	readonly dir: string
@@ -41,23 +54,20 @@ export class Session {
 	private seq = 0
 
 	constructor(opts: { id?: string; baseDir?: string; project?: string } = {}) {
-		this.id = opts.id ?? `${new Date().toISOString().replace(/[:.]/g, "-")}-${Bun.randomUUIDv7().slice(0, 8)}`
-		const project = opts.project ?? resolve(process.cwd()).replace(/[^a-zA-Z0-9]+/g, "-")
+		this.id = opts.id ?? sessionIdFor()
+		const project = opts.project ?? projectKey()
 		this.baseDir = resolve(opts.baseDir ?? ".oracle")
 		this.dir = resolve(this.baseDir, "sessions", project)
 		this.file = join(this.dir, `${this.id}.jsonl`)
 	}
 
 	async append(kind: RecordKind, data: unknown): Promise<SessionRecord> {
-		await mkdir(join(this.dir, "blobs"), { recursive: true })
 		let payload = data
 		const serialized = JSON.stringify(data)
 		if (serialized.length > INLINE_LIMIT) {
-			const hasher = new Bun.CryptoHasher("sha256")
-			hasher.update(serialized)
-			const hash = hasher.digest("hex")
+			const hash = sha256hex(serialized)
 			const blobPath = join(this.dir, "blobs", hash)
-			if (!(await Bun.file(blobPath).exists())) await Bun.write(blobPath, serialized)
+			if (!(await exists(blobPath))) await writeText(blobPath, serialized)
 			payload = { blob: hash, bytes: serialized.length }
 		}
 		const record: SessionRecord = {
@@ -66,7 +76,7 @@ export class Session {
 			kind,
 			data: payload,
 		}
-		await appendFile(this.file, `${JSON.stringify(record)}\n`)
+		await appendText(this.file, `${JSON.stringify(record)}\n`)
 		return record
 	}
 
@@ -74,15 +84,15 @@ export class Session {
 	async resolve(record: SessionRecord): Promise<unknown> {
 		const data = record.data as { blob?: string }
 		if (data && typeof data === "object" && typeof data.blob === "string") {
-			return JSON.parse(await Bun.file(join(this.dir, "blobs", data.blob)).text())
+			return JSON.parse(await readText(join(this.dir, "blobs", data.blob)))
 		}
 		return record.data
 	}
 
 	async read(): Promise<SessionRecord[]> {
-		const text = await Bun.file(this.file).text().catch(() => "")
+		const text = await readText(this.file).catch(() => "")
 		return text
-			.split("\n")
+			.split(/\r?\n/)
 			.filter(Boolean)
 			.map((line) => JSON.parse(line) as SessionRecord)
 	}
@@ -90,16 +100,12 @@ export class Session {
 	/**
 	 * Fork the transcript up to and including `throughSeq` into a new session.
 	 *
-	 * The child must open the SAME store root. this.dir is
-	 * <baseDir>/sessions/<project>, so the root is two levels up, not three;
-	 * going three levels up wrote forks into the parent of the store, where
-	 * Session.list() could never find them again.
+	 * The child must open the SAME store root, so it is passed explicitly.
 	 */
 	async fork(throughSeq: number): Promise<Session> {
 		const records = (await this.read()).filter((r) => r.seq <= throughSeq)
 		const child = new Session({ baseDir: this.baseDir })
-		await mkdir(child.dir, { recursive: true })
-		await Bun.write(child.file, `${records.map((r) => JSON.stringify(r)).join("\n")}\n`)
+		await writeText(child.file, `${records.map((r) => JSON.stringify(r)).join("\n")}\n`)
 		return child
 	}
 
@@ -109,7 +115,7 @@ export class Session {
 			const out: string[] = []
 			for (const project of projects) {
 				for (const file of await readdir(resolve(baseDir, "sessions", project))) {
-					if (file.endsWith(".jsonl")) out.push(join(project, file))
+					if (file.endsWith(".jsonl")) out.push(`${project}/${file}`)
 				}
 			}
 			return out.sort().reverse()

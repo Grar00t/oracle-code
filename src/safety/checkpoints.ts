@@ -5,25 +5,21 @@
 //
 // This implementation is content-addressed, so repeated edits of the same file
 // cost one blob per distinct content, and a restore is a copy, never a patch
-// replay.
+// replay. Hashing and file access go through src/rt so it runs under Node and
+// on Windows as well as under Bun.
 
-import { mkdir, readdir, stat } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
+import { readdir, stat } from "node:fs/promises"
+import { join, resolve } from "node:path"
+import { exists, readText, remove, sha256hex, writeText } from "../rt/index"
 
 export type CheckpointEntry = {
 	seq: number
 	path: string
 	hash: string
-	/** Null when the file did not exist before the edit. */
+	/** False when the file did not exist before the edit. */
 	existed: boolean
 	at: string
 	tool: string
-}
-
-async function sha256(data: string): Promise<string> {
-	const digest = new Bun.CryptoHasher("sha256")
-	digest.update(data)
-	return digest.digest("hex")
 }
 
 export class Checkpoints {
@@ -32,21 +28,23 @@ export class Checkpoints {
 	private seq = 0
 
 	constructor(sessionId: string, baseDir = ".oracle") {
-		this.root = resolve(baseDir, "checkpoints", sessionId)
+		// Session ids carry a timestamp with colons; those are illegal in Windows
+		// path components, so a raw id produced ENOENT on every snapshot there.
+		const safeId = sessionId.replace(/[:*?"<>|]/g, "-")
+		this.root = resolve(baseDir, "checkpoints", safeId)
 	}
 
 	async snapshot(filePath: string, tool: string): Promise<CheckpointEntry> {
-		await mkdir(join(this.root, "blobs"), { recursive: true })
 		let content = ""
 		let existed = true
 		try {
-			content = await Bun.file(filePath).text()
+			content = await readText(filePath)
 		} catch {
 			existed = false
 		}
-		const hash = await sha256(content)
+		const hash = sha256hex(content)
 		const blob = join(this.root, "blobs", hash)
-		if (!(await Bun.file(blob).exists())) await Bun.write(blob, content)
+		if (!(await exists(blob))) await writeText(blob, content)
 
 		const entry: CheckpointEntry = {
 			seq: ++this.seq,
@@ -57,7 +55,7 @@ export class Checkpoints {
 			tool,
 		}
 		this.log.push(entry)
-		await Bun.write(join(this.root, "index.jsonl"), `${this.log.map((e) => JSON.stringify(e)).join("\n")}\n`)
+		await writeText(join(this.root, "index.jsonl"), `${this.log.map((e) => JSON.stringify(e)).join("\n")}\n`)
 		return entry
 	}
 
@@ -68,15 +66,10 @@ export class Checkpoints {
 		const blob = join(this.root, "blobs", entry.hash)
 		if (!entry.existed) {
 			// The edit created the file; undo means removing it again.
-			try {
-				await Bun.file(entry.path).delete()
-			} catch {
-				// already gone
-			}
+			await remove(entry.path).catch(() => undefined)
 			return entry.path
 		}
-		await mkdir(dirname(entry.path), { recursive: true })
-		await Bun.write(entry.path, await Bun.file(blob).text())
+		await writeText(entry.path, await readText(blob))
 		return entry.path
 	}
 

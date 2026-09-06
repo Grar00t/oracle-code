@@ -11,6 +11,9 @@
 // --lint` can tell the user which keys were ignored. Silent at render time,
 // loud on request.
 
+import { join } from "node:path"
+import { home, readText } from "../rt/index"
+
 export type ThemeName = "dark" | "light" | "darkDaltonized" | "lightDaltonized" | "darkAnsi" | "lightAnsi"
 
 export type Palette = {
@@ -83,7 +86,13 @@ export const BUILT_IN: Record<ThemeName, Palette> = {
 	lightAnsi: { ...LIGHT, accent: "ansi256(27)", text: "ansi256(235)", muted: "ansi256(242)" },
 }
 
-/** Detect light or dark from $COLORFGBG, which iTerm2 and Konsole set. */
+/**
+ * Detect light or dark.
+ *
+ * $COLORFGBG is set by iTerm2 and Konsole. Windows Terminal and conhost set
+ * neither it nor anything equivalent, so on Windows the answer is "dark"
+ * unless the user names a theme.
+ */
 export function detectBackground(env = process.env): "dark" | "light" {
 	const raw = env.COLORFGBG
 	if (!raw) return "dark"
@@ -131,16 +140,27 @@ export function resolveTheme(user: UserTheme | null, fallback?: ThemeName): Reso
 			ignored.push({ key, reason: "invalid value" })
 			continue
 		}
-		;(palette as any)[key] = value
+		;(palette as unknown as Record<string, unknown>)[key] = value
 	}
 
 	return { name: user?.name ?? baseName, palette, ignored }
 }
 
+/**
+ * Where user themes live.
+ *
+ * $HOME does not exist on Windows, so the old `${process.env.HOME}/.oracle`
+ * produced the literal path "undefined/.oracle/themes/user.json" there and no
+ * user theme could ever load.
+ */
+export function themePath(name = "user"): string {
+	return join(home(), ".oracle", "themes", `${name}.json`)
+}
+
 /** Load a user theme file. A missing or malformed file is not an error. */
 export async function loadUserTheme(path: string): Promise<UserTheme | null> {
 	try {
-		return JSON.parse(await Bun.file(path).text()) as UserTheme
+		return JSON.parse(await readText(path)) as UserTheme
 	} catch {
 		return null
 	}

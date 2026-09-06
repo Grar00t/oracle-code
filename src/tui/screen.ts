@@ -15,16 +15,18 @@ import { BSU, ESU, LINK_END, RESET, link, moveTo } from "./ansi"
 export type Rect = { top: number; left: number; bottom: number; right: number }
 
 export type FrameStats = {
-	/** Cells inside the damage spans that were scanned. */
+	/** Cells actually inspected by the diff. */
 	scanned: number
-	/** Cells that actually differed and were patched. */
+	/** Cells that differed and were patched. */
 	patched: number
 	/** Bytes handed to stdout, including BSU/ESU. */
 	bytes: number
-	/** Bounding box of all damage, or null when the frame was a no-op. */
+	/** Bounding box of all patched cells, or null when the frame was a no-op. */
 	damage: Rect | null
-	/** Rows that carried at least one damaged cell. */
+	/** Rows that carried at least one real difference. */
 	damagedRows: number
+	/** Rows written this frame whose content ended up identical, skipped for free. */
+	rowsSkipped: number
 }
 
 type Buffer = {
@@ -42,21 +44,27 @@ function allocate(cells: number): Buffer {
 }
 
 /**
- * Packed cell store with two frames and per-row damage spans.
+ * Packed cell store with two frames, per-row damage spans and per-row exact
+ * difference counters.
  *
  * Pipeline per frame:
  *   beginFrame() -> blit  (typed-array copy of the previous frame)
- *   put()/fill() -> paint (writes packed ints, widening the damage span of the
- *                          affected row only when a value genuinely changed)
+ *   put()/fill() -> paint (packed int writes; each write keeps its row's count
+ *                          of cells that differ from the visible frame)
  *   render()     -> diff + optimize + one synchronized write
  *   commit()     -> swap front/back
  *
- * MEASURED (this repo, 200x120, 600 frames, bun 1.4.2, linux-x64): a single
- * bounding rectangle scanned 23636 cells to patch 5, because a spinner in one
- * corner and a status line in the other stretch one rectangle over the whole
- * screen. Per row spans took the same frame to 8127. Spans are cleared exactly,
- * through an explicit dirty-row list, so no row can carry a stale width into a
- * later frame.
+ * MEASURED on the authoritative machine (200x120, 600 frames, bun 1.4.2,
+ * linux-x64), each step forced by the previous measurement:
+ *   one bounding rectangle   scanned 23636 to patch 5
+ *   per-row spans            scanned  8127 to patch 5
+ *   steady frame with spans  scanned  4560 to patch 1, over 61 damagedRows
+ *
+ * The 4560 was not a real difference. A widget tree blanks its box and repaints
+ * the same text every frame; the blank differs from the visible frame and the
+ * repaint restores it. Spans can only widen, so they kept the width of a change
+ * that no longer existed. Counters can go back down, which is why the count is
+ * authoritative here and the span is only a bound on where to look.
  *
  * Nothing here allocates per cell, and the interning pools are shared by both
  * frames so ids stay valid across the blit.
@@ -70,13 +78,23 @@ export class Screen {
 	/** Inclusive row range that carries damage; dTop < 0 means none. */
 	private dTop = -1
 	private dBottom = -1
-	/** Per row column span. rowMax < rowMin means the row is clean. */
+	/** Per row column span. rowMax < rowMin means nothing was touched. */
 	private rowMin: Int32Array
 	private rowMax: Int32Array
+	/** Exact count per row of cells differing from the visible frame. */
+	private rowDiff: Int32Array
 	/** Rows touched this frame, so clearing costs one pass over them only. */
 	private dirtyRows: Int32Array
 	private dirtyCount = 0
-	lastStats: FrameStats = { scanned: 0, patched: 0, bytes: 0, damage: null, damagedRows: 0 }
+	private pendingDiffs = 0
+	lastStats: FrameStats = {
+		scanned: 0,
+		patched: 0,
+		bytes: 0,
+		damage: null,
+		damagedRows: 0,
+		rowsSkipped: 0,
+	}
 
 	constructor(cols: number, rows: number) {
 		this.cols = Math.max(1, cols)
@@ -86,6 +104,7 @@ export class Screen {
 		this.back = allocate(cells)
 		this.rowMin = new Int32Array(this.rows).fill(this.cols)
 		this.rowMax = new Int32Array(this.rows).fill(-1)
+		this.rowDiff = new Int32Array(this.rows)
 		this.dirtyRows = new Int32Array(this.rows)
 	}
 
@@ -98,13 +117,14 @@ export class Screen {
 		// Force a full repaint by making the front frame impossible to match.
 		this.front.chars.fill(-1)
 		this.back = allocate(cells)
-		this.rowMin = new Int32Array(this.rows).fill(0)
-		this.rowMax = new Int32Array(this.rows).fill(this.cols - 1)
+		this.rowMin = new Int32Array(this.rows).fill(this.cols)
+		this.rowMax = new Int32Array(this.rows).fill(-1)
+		this.rowDiff = new Int32Array(this.rows)
 		this.dirtyRows = new Int32Array(this.rows)
-		for (let y = 0; y < this.rows; y++) this.dirtyRows[y] = y
-		this.dirtyCount = this.rows
-		this.dTop = 0
-		this.dBottom = this.rows - 1
+		this.dirtyCount = 0
+		this.pendingDiffs = 0
+		this.dTop = -1
+		this.dBottom = -1
 	}
 
 	beginFrame(): void {
@@ -113,20 +133,20 @@ export class Screen {
 		this.back.chars.set(this.front.chars)
 		this.back.styles.set(this.front.styles)
 		this.back.links.set(this.front.links)
-		// Clear exactly the rows that were dirty, not a range that merely contains
-		// them. A range leaves stale spans behind on the rows it skipped.
+		// Clear exactly the rows that were touched, not a range containing them.
 		for (let i = 0; i < this.dirtyCount; i++) {
 			const y = this.dirtyRows[i]!
 			this.rowMin[y] = this.cols
 			this.rowMax[y] = -1
+			this.rowDiff[y] = 0
 		}
 		this.dirtyCount = 0
+		this.pendingDiffs = 0
 		this.dTop = -1
 		this.dBottom = -1
 	}
 
 	private touch(x: number, y: number): void {
-		// First damage on this row: remember it so beginFrame can clear it.
 		if (this.rowMax[y]! < this.rowMin[y]!) {
 			this.dirtyRows[this.dirtyCount++] = y
 			this.rowMin[y] = x
@@ -160,20 +180,28 @@ export class Screen {
 			charId === CHAR_SPACE && !StylePool.visibleOnSpace(styleId)
 				? STYLE_DEFAULT
 				: styleId
-		const changed =
-			this.back.chars[i] !== charId ||
-			this.back.styles[i] !== effective ||
-			this.back.links[i] !== linkId
+
+		const frontChar = this.front.chars[i]!
+		const frontStyle = this.front.styles[i]!
+		const frontLink = this.front.links[i]!
+		const wasDiff =
+			this.back.chars[i] !== frontChar ||
+			this.back.styles[i] !== frontStyle ||
+			this.back.links[i] !== frontLink
+
 		this.back.chars[i] = charId
 		this.back.styles[i] = effective
 		this.back.links[i] = linkId
-		if (
-			changed ||
-			this.front.chars[i] !== charId ||
-			this.front.styles[i] !== effective ||
-			this.front.links[i] !== linkId
-		)
-			this.touch(x, y)
+
+		const isDiff = charId !== frontChar || effective !== frontStyle || linkId !== frontLink
+		if (isDiff !== wasDiff) {
+			const delta = isDiff ? 1 : -1
+			this.rowDiff[y] = this.rowDiff[y]! + delta
+			this.pendingDiffs += delta
+		}
+		// The span only bounds where to look. A reverted write leaves the span
+		// wide but the row's counter back at zero, and a zero row is never read.
+		if (isDiff) this.touch(x, y)
 	}
 
 	fill(rect: Rect, style: Style = {}): void {
@@ -225,10 +253,18 @@ export class Screen {
 		return this.putClusters(x, y, laid.clusters, style, opts.url ?? "")
 	}
 
-	/** Diff the damaged spans, merge patches, and serialize one write. */
+	/** Diff the rows that really changed, merge patches, and serialize one write. */
 	render(): string {
-		if (this.dTop < 0) {
-			this.lastStats = { scanned: 0, patched: 0, bytes: 0, damage: null, damagedRows: 0 }
+		if (this.dTop < 0 || this.pendingDiffs === 0) {
+			const rowsSkipped = this.dTop < 0 ? 0 : this.dirtyCount
+			this.lastStats = {
+				scanned: 0,
+				patched: 0,
+				bytes: 0,
+				damage: null,
+				damagedRows: 0,
+				rowsSkipped,
+			}
 			return ""
 		}
 
@@ -240,6 +276,7 @@ export class Screen {
 		let scanned = 0
 		let patched = 0
 		let damagedRows = 0
+		let rowsSkipped = 0
 		let activeStyle = -1
 		let activeLink = LINK_NONE
 		let boundLeft = this.cols
@@ -248,22 +285,25 @@ export class Screen {
 		let boundBottom = -1
 
 		for (let y = this.dTop; y <= this.dBottom; y++) {
+			const target = this.rowDiff[y]!
 			const spanLeft = this.rowMin[y]!
 			const spanRight = this.rowMax[y]!
-			// Clean row inside the dirty range: skipped without touching a cell.
 			if (spanRight < spanLeft) continue
+			// Written, then written back to what is already on screen: free.
+			if (target === 0) {
+				rowsSkipped++
+				continue
+			}
 			damagedRows++
 			if (boundTop < 0) boundTop = y
 			boundBottom = y
-			if (spanLeft < boundLeft) boundLeft = spanLeft
-			if (spanRight > boundRight) boundRight = spanRight
 
 			const rowBase = y * this.cols
+			let found = 0
 			let x = spanLeft
-			while (x <= spanRight) {
+			while (x <= spanRight && found < target) {
 				const i = rowBase + x
 				scanned++
-				// Two Int32 comparisons per cell, plus the link word.
 				if (
 					this.back.chars[i] === this.front.chars[i] &&
 					this.back.styles[i] === this.front.styles[i] &&
@@ -276,6 +316,7 @@ export class Screen {
 				// Extend the run, absorbing short identical gaps (optimize stage).
 				let end = x
 				let gap = 0
+				let runDiffs = 0
 				for (let probe = x; probe <= spanRight; probe++) {
 					const j = rowBase + probe
 					const same =
@@ -288,8 +329,14 @@ export class Screen {
 					} else {
 						gap = 0
 						end = probe
+						runDiffs++
+						if (runDiffs === target - found) break
 					}
 				}
+				found += runDiffs
+
+				if (x < boundLeft) boundLeft = x
+				if (end > boundRight) boundRight = end
 
 				out += moveTo(y, x)
 				for (let k = x; k <= end; k++) {
@@ -320,7 +367,7 @@ export class Screen {
 				? null
 				: { top: boundTop, left: boundLeft, bottom: boundBottom, right: boundRight }
 
-		this.lastStats = { scanned, patched, bytes: out.length, damage, damagedRows }
+		this.lastStats = { scanned, patched, bytes: out.length, damage, damagedRows, rowsSkipped }
 		return out
 	}
 

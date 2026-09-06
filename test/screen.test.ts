@@ -47,8 +47,7 @@ describe("packed screen", () => {
 	test("far-apart changes do not drag the scan across the whole screen", () => {
 		// Regression guard, from a measured bench run: with one bounding rectangle
 		// a spinner in the top-left plus a status bar in the bottom-right made the
-		// diff scan 23636 cells to patch 5. Damage is per row, so the scan must stay
-		// proportional to the two short spans that actually changed.
+		// diff scan 23636 cells to patch 5.
 		const screen = new Screen(200, 120)
 		const frame = (spinner: string, tail: string) => {
 			screen.beginFrame()
@@ -62,14 +61,11 @@ describe("packed screen", () => {
 		frame("/", "bbb")
 		expect(screen.lastStats.damagedRows).toBe(2)
 		expect(screen.lastStats.scanned).toBeLessThanOrEqual(64)
-		// The bounding box still spans the screen; only the scan is confined.
 		expect(screen.lastStats.damage).toEqual({ top: 0, left: 0, bottom: 119, right: 192 })
 	})
 
 	test("a row dirtied in an earlier frame does not pay again later", () => {
-		// Spans must be cleared per row, not across the previous row range. A wide
-		// row from two frames ago must not be rescanned because a later frame's row
-		// range happens to contain it.
+		// Spans must be cleared per row, not across the previous row range.
 		const screen = new Screen(200, 120)
 		const frame = (paint: () => void) => {
 			screen.beginFrame()
@@ -86,6 +82,34 @@ describe("packed screen", () => {
 		})
 		expect(screen.lastStats.damagedRows).toBe(2)
 		expect(screen.lastStats.scanned).toBeLessThanOrEqual(8)
+	})
+
+	test("repainting identical content over a blanked box costs no reads", () => {
+		// Regression guard, from a measured bench run: a steady frame patched 1 cell
+		// but scanned 4560 across 61 rows, because the tree blanks its box and
+		// repaints the same text every frame. Per-row difference counters return to
+		// zero when a write is reverted inside the same frame, so those rows must be
+		// skipped without a single cell read.
+		const screen = new Screen(200, 120)
+		const body = Array.from(
+			{ length: 60 },
+			(_, i) => `message ${i}: packed cells, damage spans, cell diff, one write.`,
+		)
+		const frame = (spinner: string) => {
+			screen.beginFrame()
+			screen.fill({ top: 0, left: 0, bottom: 119, right: 199 })
+			for (let y = 0; y < body.length; y++) screen.putText(0, y, body[y]!)
+			screen.putText(0, 119, `${spinner} thinking`)
+			const patch = screen.render()
+			screen.commit()
+			return patch
+		}
+		frame("|")
+		frame("/")
+		expect(screen.lastStats.patched).toBe(1)
+		expect(screen.lastStats.damagedRows).toBe(1)
+		expect(screen.lastStats.rowsSkipped).toBeGreaterThanOrEqual(60)
+		expect(screen.lastStats.scanned).toBeLessThanOrEqual(16)
 	})
 
 	test("synchronized output wraps every non-empty write", () => {

@@ -8,6 +8,10 @@
 // if it declares readOnly itself AND its source is trusted. An undeclared MCP
 // tool is quarantined: it runs serially and always needs a permission decision,
 // even in acceptEdits mode.
+//
+// The scheduler decides concurrency. It reports risk faithfully and never
+// decides approval; Permissions.check owns that, so the firewall cannot be
+// weakened by a caller that flattens quarantine into "not read-only".
 
 import type { ToolCall, ToolSchema } from "./model"
 import type { Checkpoints } from "../safety/checkpoints"
@@ -111,8 +115,9 @@ async function runOne(
 	const decision = await ctx.permissions.check(
 		tool.name,
 		{
-			readOnly: Boolean(tool.readOnly) && !tool.quarantined,
+			readOnly: Boolean(tool.readOnly),
 			irreversible: Boolean(tool.irreversible),
+			quarantined: Boolean(tool.quarantined),
 		},
 		summary,
 	)

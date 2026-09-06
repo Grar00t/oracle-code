@@ -5,6 +5,12 @@
 //
 // Addition here: a decision is a value that gets recorded. Nothing mutates the
 // world without a Decision object that the effect ledger can point at later.
+//
+// Two risks are never auto-approved outside full mode:
+//   irreversible — no checkpoint can restore it.
+//   quarantined  — untrusted origin, so its own readOnly claim is not evidence.
+// Both live here rather than in the scheduler, so no caller can weaken them by
+// pre-flattening the risk it reports.
 
 export type PermissionMode =
 	| "plan" // no side effects at all, not even file writes
@@ -24,9 +30,12 @@ export type Decision = {
 }
 
 export type ToolRisk = {
+	/** Declared by the tool author. Only trusted when the tool is not quarantined. */
 	readOnly: boolean
 	/** Effects outside the working tree that no snapshot can undo. */
 	irreversible: boolean
+	/** Untrusted origin (undeclared MCP tool, unapproved plugin). */
+	quarantined?: boolean
 }
 
 export type Prompter = (question: string) => Promise<boolean>
@@ -55,8 +64,12 @@ export class Permissions {
 	async check(tool: string, risk: ToolRisk, summary: string): Promise<Decision> {
 		const at = new Date().toISOString()
 		const base = { mode: this.mode, prompted: false, at }
+		const quarantined = Boolean(risk.quarantined)
 
-		if (risk.readOnly) return { ...base, allowed: true, reason: "read-only tool" }
+		// A quarantined tool's readOnly claim is not evidence, so it does not open
+		// this door.
+		if (risk.readOnly && !quarantined)
+			return { ...base, allowed: true, reason: "read-only tool" }
 
 		if (this.mode === "plan")
 			return { ...base, allowed: false, reason: "plan mode forbids side effects" }
@@ -66,13 +79,15 @@ export class Permissions {
 
 		if (this.mode === "full") return { ...base, allowed: true, reason: "full-access mode" }
 
-		if (this.mode === "acceptEdits" && !risk.irreversible)
+		if (this.mode === "acceptEdits" && !risk.irreversible && !quarantined)
 			return { ...base, allowed: true, reason: "reversible file edit auto-approved" }
 
-		// Irreversible effects are always prompted, in every mode except full.
+		// Irreversible and quarantined calls are prompted in every mode except full.
 		const label = risk.irreversible
 			? `IRREVERSIBLE \u2014 ${tool}: ${summary}. No checkpoint can undo this. Allow?`
-			: `${tool}: ${summary}. Allow?`
+			: quarantined
+				? `QUARANTINED \u2014 ${tool}: ${summary}. Untrusted origin, its read-only hint is not trusted. Allow?`
+				: `${tool}: ${summary}. Allow?`
 		const allowed = await this.prompt(label)
 		return {
 			...base,

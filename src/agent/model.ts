@@ -4,9 +4,12 @@
 // at a local server (khz / llama.cpp), so offline is the normal case rather than
 // a degraded one. No vendor-specific field is required anywhere in this file.
 //
-// Two additions here exist because of observed failures, not taste:
+// Three things here exist because of observed failures, not taste:
 //   - probe(): an unreachable endpoint must say which address failed and what to
 //     do next. Waiting in silence is not a diagnosis.
+//   - withTimeout(): a request owns its own abort timer and releases it on the
+//     way out. A timer that outlives its request holds the event loop and
+//     delays process exit for the length of the timeout.
 //   - chatTemplateKwargs: on a server-rendered chat template this is the only
 //     place a reasoning budget can be set, and on one consumer GPU that budget
 //     dominates wall time far more than any sampling parameter.
@@ -51,6 +54,32 @@ export type Completion = {
 export type ProbeResult =
 	| { ok: true; models: string[] }
 	| { ok: false; reason: string; hint: string }
+
+let liveTimers = 0
+
+/**
+ * How many abort timers are still armed. Must be 0 whenever no request is in
+ * flight; a non-zero count means something is holding the event loop open.
+ */
+export function liveAbortTimers(): number {
+	return liveTimers
+}
+
+// The timer lives exactly as long as the call it guards. AbortSignal.timeout
+// cannot do this: its timer runs to completion regardless.
+function withTimeout<T>(ms: number, run: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+	if (ms <= 0) return run()
+	const controller = new AbortController()
+	liveTimers++
+	const handle = setTimeout(
+		() => controller.abort(Object.assign(new Error("the request timed out"), { name: "TimeoutError" })),
+		ms,
+	)
+	return run(controller.signal).finally(() => {
+		clearTimeout(handle)
+		liveTimers--
+	})
+}
 
 function wire(messages: Message[]): unknown[] {
 	return messages.map((m) => {
@@ -162,10 +191,9 @@ export class Model {
 		const url = `${this.baseUrl}/models`
 		let res: Response
 		try {
-			res = await this.fetchImpl(url, {
-				headers: this.headers(),
-				signal: AbortSignal.timeout(this.probeTimeoutMs),
-			})
+			res = await withTimeout(this.probeTimeoutMs, (signal) =>
+				this.fetchImpl(url, { headers: this.headers(), ...(signal ? { signal } : {}) }),
+			)
 		} catch (error) {
 			return { ok: false, ...describeFailure(error, this.baseUrl) }
 		}
@@ -219,16 +247,18 @@ export class Model {
 				: {}),
 		}
 
+		// The cap covers getting a response, not draining it. A long generation is
+		// not a stalled request, and must not be aborted like one.
 		let res: Response
 		try {
-			res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
-				method: "POST",
-				headers: { "content-type": "application/json", ...this.headers() },
-				body: JSON.stringify(body),
-				...(this.requestTimeoutMs > 0
-					? { signal: AbortSignal.timeout(this.requestTimeoutMs) }
-					: {}),
-			})
+			res = await withTimeout(this.requestTimeoutMs, (signal) =>
+				this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+					method: "POST",
+					headers: { "content-type": "application/json", ...this.headers() },
+					body: JSON.stringify(body),
+					...(signal ? { signal } : {}),
+				}),
+			)
 		} catch (error) {
 			const { reason, hint } = describeFailure(error, this.baseUrl)
 			throw new Error(`${reason}. ${hint}`)

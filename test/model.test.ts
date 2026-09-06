@@ -2,7 +2,7 @@
 // fresh machine. Every test here would have failed before the probe existed.
 
 import { describe, expect, test } from "bun:test"
-import { Model } from "../src/agent/model"
+import { liveAbortTimers, Model } from "../src/agent/model"
 
 function sse(payload: unknown): string {
 	return `data: ${JSON.stringify(payload)}\n\n`
@@ -53,6 +53,22 @@ describe("model transport", () => {
 		expect(probe.ok).toBe(true)
 		if (probe.ok) expect(probe.models).toEqual(["gpt-oss-20b"])
 		expect(calls[0]?.url).toBe("http://172.24.208.1:8080/v1/models")
+	})
+
+	// A timer that outlives its request holds the event loop. The symptom is a
+	// suite, or a one-shot run, that idles for the length of the timeout after
+	// all the work is already done.
+	test("a finished request leaves no timer armed behind it", async () => {
+		const { fetchImpl } = recorder(() => new Response(JSON.stringify({ data: [] }), { status: 200 }))
+		const model = new Model({ baseUrl: "http://127.0.0.1:8080/v1", probeTimeoutMs: 600000, fetchImpl })
+
+		await model.probe()
+		await new Model({ fetchImpl: recorder(() => streamOf(STOP)).fetchImpl, requestTimeoutMs: 600000 }).complete(
+			[{ role: "user", content: "x" }],
+			[],
+		)
+
+		expect(liveAbortTimers()).toBe(0)
 	})
 
 	test("a refused connection blames the port and names the address", async () => {

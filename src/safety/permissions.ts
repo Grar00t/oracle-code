@@ -1,22 +1,13 @@
 // Permission modes.
 //
-// FACT (reference tool): read-only by default; every mutation or command needs a
-// human decision in manual mode. Modes cycle with Shift+Tab.
-//
-// Addition here: a decision is a value that gets recorded. Nothing mutates the
-// world without a Decision object that the effect ledger can point at later.
-//
-// Two risks are never auto-approved outside full mode:
-//   irreversible — no checkpoint can restore it.
-//   quarantined  — untrusted origin, so its own readOnly claim is not evidence.
-// Both live here rather than in the scheduler, so no caller can weaken them by
-// pre-flattening the risk it reports.
+// The order of the gates is the whole contract. The session allowlist and
+// full-access mode are conveniences for repeated, recoverable work; they must
+// never rank above the two gates that exist precisely because the action cannot
+// be taken back. An "always allow" answered once for an rm -rf used to make
+// every later rm -rf with the same summary silent, which is the opposite of
+// what the human agreed to.
 
-export type PermissionMode =
-	| "plan" // no side effects at all, not even file writes
-	| "manual" // ask for every mutation and every command
-	| "acceptEdits" // file edits auto-approved, commands still asked
-	| "full" // everything auto-approved; still fully logged
+export type PermissionMode = "plan" | "manual" | "acceptEdits" | "full"
 
 export const MODE_CYCLE: PermissionMode[] = ["manual", "acceptEdits", "plan", "full"]
 
@@ -24,17 +15,13 @@ export type Decision = {
 	allowed: boolean
 	mode: PermissionMode
 	reason: string
-	/** True when a human answered a prompt for this specific call. */
 	prompted: boolean
 	at: string
 }
 
 export type ToolRisk = {
-	/** Declared by the tool author. Only trusted when the tool is not quarantined. */
 	readOnly: boolean
-	/** Effects outside the working tree that no snapshot can undo. */
 	irreversible: boolean
-	/** Untrusted origin (undeclared MCP tool, unapproved plugin). */
 	quarantined?: boolean
 }
 
@@ -56,7 +43,13 @@ export class Permissions {
 		return this.mode
 	}
 
-	/** Remember "always allow" answers for the rest of the session. */
+	/**
+	 * Remember a human "yes" for the rest of the session.
+	 *
+	 * Only consulted for recoverable actions. Irreversible and quarantined
+	 * tools are gated before the allowlist is read, so nothing recorded here
+	 * can ever suppress those prompts.
+	 */
 	alwaysAllow(key: string): void {
 		this.allowlist.add(key)
 	}
@@ -66,26 +59,39 @@ export class Permissions {
 		const base = { mode: this.mode, prompted: false, at }
 		const quarantined = Boolean(risk.quarantined)
 
-		// A quarantined tool's readOnly claim is not evidence, so it does not open
-		// this door.
+		// 1. A genuinely read-only tool of trusted origin has no side effect.
 		if (risk.readOnly && !quarantined)
 			return { ...base, allowed: true, reason: "read-only tool" }
 
+		// 2. Plan mode forbids side effects outright.
 		if (this.mode === "plan")
 			return { ...base, allowed: false, reason: "plan mode forbids side effects" }
 
+		// 3. The gates no convenience may outrank. Checked BEFORE the allowlist
+		//    and before full-access mode, on purpose.
+		if (risk.irreversible || quarantined) return await this.ask(tool, risk, summary, base)
+
+		// 4. Conveniences, for recoverable actions only.
 		const key = `${tool}:${summary}`
 		if (this.allowlist.has(key)) return { ...base, allowed: true, reason: "session allowlist" }
 
 		if (this.mode === "full") return { ...base, allowed: true, reason: "full-access mode" }
 
-		if (this.mode === "acceptEdits" && !risk.irreversible && !quarantined)
+		if (this.mode === "acceptEdits")
 			return { ...base, allowed: true, reason: "reversible file edit auto-approved" }
 
-		// Irreversible and quarantined calls are prompted in every mode except full.
+		return await this.ask(tool, risk, summary, base)
+	}
+
+	private async ask(
+		tool: string,
+		risk: ToolRisk,
+		summary: string,
+		base: { mode: PermissionMode; prompted: boolean; at: string },
+	): Promise<Decision> {
 		const label = risk.irreversible
 			? `IRREVERSIBLE \u2014 ${tool}: ${summary}. No checkpoint can undo this. Allow?`
-			: quarantined
+			: risk.quarantined
 				? `QUARANTINED \u2014 ${tool}: ${summary}. Untrusted origin, its read-only hint is not trusted. Allow?`
 				: `${tool}: ${summary}. Allow?`
 		const allowed = await this.prompt(label)

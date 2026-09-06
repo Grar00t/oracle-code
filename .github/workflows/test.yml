@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bun:
+    name: bun test + typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Pinned by commit SHA: a moving tag is a supply-chain hole.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Installed from the official script rather than an unpinned third-party
+      # action, so there is no unpinned tag anywhere in this workflow.
+      - name: install bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: versions
+        run: |
+          bun --version
+          uname -srm
+
+      - name: install dependencies
+        run: bun install
+
+      - name: test
+        run: bun test
+
+      - name: typecheck
+        run: bun x tsc --noEmit

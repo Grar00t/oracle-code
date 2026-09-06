@@ -98,12 +98,19 @@ const COLOR_RE = /^(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}|rgb\(\s*\d{1,3}\s*,\s*\d{1,3
 
 export type UserTheme = { name?: string; base?: ThemeName; overrides?: Record<string, unknown> }
 
+export type IgnoreReason = "unknown key" | "unsupported key" | "invalid value"
+
 export type ResolvedTheme = {
 	name: string
 	palette: Palette
 	/** Keys that were dropped, and why. Empty on a clean file. */
-	ignored: Array<{ key: string; reason: "unknown key" | "invalid value" }>
+	ignored: Array<{ key: string; reason: IgnoreReason }>
 }
+
+// Real palette keys that hold arrays rather than a single colour. A file naming
+// one of these is not making a typo, so it must not be reported as an unknown
+// key: that sends the reader looking for a spelling mistake that does not exist.
+const UNSUPPORTED_KEYS = new Set(["subagents", "rainbow"])
 
 export function resolveTheme(user: UserTheme | null, fallback?: ThemeName): ResolvedTheme {
 	const baseName: ThemeName = user?.base ?? fallback ?? (detectBackground() === "light" ? "light" : "dark")
@@ -112,7 +119,11 @@ export function resolveTheme(user: UserTheme | null, fallback?: ThemeName): Reso
 	const ignored: ResolvedTheme["ignored"] = []
 
 	for (const [key, value] of Object.entries(user?.overrides ?? {})) {
-		if (!(key in palette) || key === "subagents" || key === "rainbow") {
+		if (UNSUPPORTED_KEYS.has(key)) {
+			ignored.push({ key, reason: "unsupported key" })
+			continue
+		}
+		if (!(key in palette)) {
 			ignored.push({ key, reason: "unknown key" })
 			continue
 		}

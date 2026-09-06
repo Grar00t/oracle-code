@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Registry, executeBatch, type Tool, type ToolContext } from "../src/agent/tools"
+import { Registry, canRunParallel, executeBatch, type Tool, type ToolContext } from "../src/agent/tools"
 import { Permissions } from "../src/safety/permissions"
 import { estimateTokens, messagesTokens } from "../src/agent/context"
 import { detectBackground, resolveTheme } from "../src/theme/theme"
@@ -110,6 +110,62 @@ describe("tool scheduler", () => {
 		expect(decision.allowed).toBe(false)
 		expect(decision.prompted).toBe(true)
 		expect(asked).toContain("IRREVERSIBLE")
+	})
+
+	// D9: eligibility is not evidence of overlap. The reported flag used to be a
+	// constant true for every eligible group, so a lone read-only call claimed a
+	// concurrency that never happened.
+	test("a lone eligible call is reported as serial, a pair as parallel", async () => {
+		const order: string[] = []
+		const registry = new Registry().register(
+			tool("r1", { readOnly: true }, order),
+			tool("r2", { readOnly: true }, order),
+		)
+		const ctx = () => stubContext(new Permissions("manual"))
+
+		const alone = await executeBatch([{ id: "1", name: "r1", arguments: "{}" }], registry, ctx())
+		expect(alone[0]!.ok).toBe(true)
+		expect(canRunParallel(registry.get("r1"))).toBe(true)
+		expect(alone[0]!.parallel).toBe(false)
+
+		const pair = await executeBatch(
+			[
+				{ id: "1", name: "r1", arguments: "{}" },
+				{ id: "2", name: "r2", arguments: "{}" },
+			],
+			registry,
+			ctx(),
+		)
+		expect(pair.map((o) => o.parallel)).toEqual([true, true])
+	})
+
+	test("an ineligible call between two eligible ones splits the group", async () => {
+		const order: string[] = []
+		const registry = new Registry().register(
+			tool("r1", { readOnly: true }, order),
+			tool("w", {}, order),
+			tool("r2", { readOnly: true }, order),
+		)
+		const outcomes = await executeBatch(
+			[
+				{ id: "1", name: "r1", arguments: "{}" },
+				{ id: "2", name: "w", arguments: "{}" },
+				{ id: "3", name: "r2", arguments: "{}" },
+			],
+			registry,
+			stubContext(new Permissions("full")),
+		)
+		expect(outcomes.map((o) => o.call.name)).toEqual(["r1", "w", "r2"])
+		// Two eligible calls, neither of which ever overlapped anything.
+		expect(outcomes.map((o) => o.parallel)).toEqual([false, false, false])
+		expect(order).toEqual([
+			"start:r1",
+			"end:r1",
+			"start:w",
+			"end:w",
+			"start:r2",
+			"end:r2",
+		])
 	})
 })
 

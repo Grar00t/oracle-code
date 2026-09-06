@@ -47,6 +47,11 @@ export type ToolOutcome = {
 	ok: boolean
 	output: string
 	durationMs: number
+	/**
+	 * Whether this call actually overlapped another one. Eligibility is not
+	 * enough: a read-only call that arrived alone ran alone, and reporting it as
+	 * parallel would make the interface claim concurrency that never happened.
+	 */
 	parallel: boolean
 }
 
@@ -82,6 +87,9 @@ export class Registry {
  * restating the rule. A second copy would not widen the firewall, because
  * executeBatch is the only caller that starts work, but it would let the
  * interface claim a call ran in parallel when it did not.
+ *
+ * This answers "may it overlap", which is not the same question as "did it".
+ * ToolOutcome.parallel answers the second one.
  */
 export function canRunParallel(tool: Tool | undefined): boolean {
 	return Boolean(tool?.readOnly) && !tool?.quarantined
@@ -182,7 +190,11 @@ export async function executeBatch(
 				group.push(calls[i]!)
 				i++
 			}
-			const batch = await Promise.all(group.map((c) => runOne(c, registry, ctx, true)))
+			// An eligible call that arrived alone still ran alone.
+			const overlapped = group.length > 1
+			const batch = await Promise.all(
+				group.map((c) => runOne(c, registry, ctx, overlapped)),
+			)
 			results.push(...batch)
 			continue
 		}

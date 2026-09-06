@@ -36,12 +36,15 @@ export class Session {
 	readonly id: string
 	readonly dir: string
 	readonly file: string
+	/** The store root this session was opened under: <baseDir>. */
+	readonly baseDir: string
 	private seq = 0
 
 	constructor(opts: { id?: string; baseDir?: string; project?: string } = {}) {
 		this.id = opts.id ?? `${new Date().toISOString().replace(/[:.]/g, "-")}-${Bun.randomUUIDv7().slice(0, 8)}`
 		const project = opts.project ?? resolve(process.cwd()).replace(/[^a-zA-Z0-9]+/g, "-")
-		this.dir = resolve(opts.baseDir ?? ".oracle", "sessions", project)
+		this.baseDir = resolve(opts.baseDir ?? ".oracle")
+		this.dir = resolve(this.baseDir, "sessions", project)
 		this.file = join(this.dir, `${this.id}.jsonl`)
 	}
 
@@ -84,10 +87,17 @@ export class Session {
 			.map((line) => JSON.parse(line) as SessionRecord)
 	}
 
-	/** Fork the transcript up to and including `throughSeq` into a new session. */
+	/**
+	 * Fork the transcript up to and including `throughSeq` into a new session.
+	 *
+	 * The child must open the SAME store root. this.dir is
+	 * <baseDir>/sessions/<project>, so the root is two levels up, not three;
+	 * going three levels up wrote forks into the parent of the store, where
+	 * Session.list() could never find them again.
+	 */
 	async fork(throughSeq: number): Promise<Session> {
 		const records = (await this.read()).filter((r) => r.seq <= throughSeq)
-		const child = new Session({ baseDir: resolve(this.dir, "..", "..", "..") })
+		const child = new Session({ baseDir: this.baseDir })
 		await mkdir(child.dir, { recursive: true })
 		await Bun.write(child.file, `${records.map((r) => JSON.stringify(r)).join("\n")}\n`)
 		return child

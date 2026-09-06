@@ -4,12 +4,19 @@
 // layout is a single measure pass plus a single paint pass. The tree is cheap
 // enough to rebuild that diffing it would cost more than it saves — the diffing
 // that matters happens on the cell grid, not on the node tree.
+//
+// MEASURED at 3ed3e74 (200x120, 600 frames, bun 1.4.2, linux-x64): paint was
+// 2.239 ms of a 2.254 ms frame while the diff was 0.001 ms. The measure pass
+// and the paint pass both wrapped every text node, and the paint pass reshaped
+// text that had not changed, so identical frames paid full price. Wrapping and
+// shaping are now keyed by content in lines.ts; the tree still rebuilds.
 
-import { layoutLine } from "../text"
 import type { Direction } from "../text/bidi"
-import { stringWidth } from "../text/width"
+import { wrapCached } from "./lines"
 import type { Screen } from "./screen"
 import type { Style } from "./pools"
+
+export { wrapText, wrapCached, wrapCacheStats, clearWrapCache } from "./lines"
 
 export type TextNode = {
 	kind: "text"
@@ -56,49 +63,12 @@ export const box = (children: Node[], props: Omit<BoxNode, "kind" | "children"> 
 
 export const spacer = (size = 1): SpacerNode => ({ kind: "spacer", size })
 
-/** Greedy word wrap on logical text. Shaping and reordering happen per line. */
-export function wrapText(text: string, width: number): string[] {
-	if (width <= 0) return []
-	const out: string[] = []
-	for (const paragraph of text.split("\n")) {
-		if (paragraph === "") {
-			out.push("")
-			continue
-		}
-		let line = ""
-		for (const word of paragraph.split(/(\s+)/)) {
-			if (word === "") continue
-			const candidate = line + word
-			if (stringWidth(candidate) <= width) {
-				line = candidate
-				continue
-			}
-			if (line.trim() !== "") out.push(line.trimEnd())
-			if (stringWidth(word) <= width) {
-				line = word.trimStart()
-				continue
-			}
-			// Hard break for a single oversized token.
-			let chunk = ""
-			for (const ch of word) {
-				if (stringWidth(chunk + ch) > width) {
-					out.push(chunk)
-					chunk = ""
-				}
-				chunk += ch
-			}
-			line = chunk
-		}
-		out.push(line.trimEnd())
-	}
-	return out
-}
-
 function measureHeight(node: Node, width: number): number {
 	switch (node.kind) {
 		case "text": {
 			if (node.wrap === false) return 1
-			return Math.max(1, wrapText(node.text, width).length)
+			// Same question the paint pass will ask about the same node: one wrap.
+			return Math.max(1, wrapCached(node.text, width).length)
 		}
 		case "spacer":
 			return node.size ?? 1
@@ -142,15 +112,17 @@ export function paint(
 			return
 
 		case "text": {
-			const lines = node.wrap === false ? [node.text] : wrapText(node.text, width)
+			const lines = node.wrap === false ? [node.text] : wrapCached(node.text, width)
 			for (let i = 0; i < Math.min(lines.length, height); i++) {
-				const laid = layoutLine(lines[i]!, node.direction)
+				// Cached: shaping, reordering, clustering and interning happen once
+				// per distinct line, not once per frame.
+				const laid = screen.lines.shape(lines[i]!, node.direction)
 				// Right-to-left paragraphs are flushed to the right edge of the box,
 				// which is what makes mixed Arabic and Latin output readable in a grid.
 				const offset = laid.direction === "rtl" ? Math.max(0, width - laid.width) : 0
-				const drawn = screen.putClusters(x + offset, y + i, laid.clusters, node.style, node.url ?? "")
-				// Blank the rest of the line so stale glyphs cannot survive a blit.
 				const usedStart = x + offset
+				const drawn = screen.putCells(usedStart, y + i, laid.ids, node.style, node.url ?? "")
+				// Blank the rest of the line so stale glyphs cannot survive a blit.
 				if (offset > 0) {
 					screen.fill({ top: y + i, bottom: y + i, left: x, right: usedStart - 1 }, node.style ?? {})
 				}
@@ -243,13 +215,15 @@ function drawBorder(
 	title: string | undefined,
 ): void {
 	const s = style ?? {}
-	const top = ["\u256d", ...Array(Math.max(0, width - 2)).fill("\u2500"), "\u256e"]
-	const bottom = ["\u2570", ...Array(Math.max(0, width - 2)).fill("\u2500"), "\u256f"]
-	screen.putClusters(x, y, top, s)
-	screen.putClusters(x, y + height - 1, bottom, s)
+	// Border runs are visual already: no shaping, no reordering, and the interned
+	// ids are cached by string so a resized border is the only thing that pays.
+	const dashes = "\u2500".repeat(Math.max(0, width - 2))
+	screen.putCells(x, y, screen.lines.run(`\u256d${dashes}\u256e`), s)
+	screen.putCells(x, y + height - 1, screen.lines.run(`\u2570${dashes}\u256f`), s)
+	const bar = screen.lines.run("\u2502")
 	for (let row = y + 1; row < y + height - 1; row++) {
-		screen.putClusters(x, row, ["\u2502"], s)
-		screen.putClusters(x + width - 1, row, ["\u2502"], s)
+		screen.putCells(x, row, bar, s)
+		screen.putCells(x + width - 1, row, bar, s)
 	}
 	if (title) screen.putText(x + 2, y, ` ${title} `, s)
 }

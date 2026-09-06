@@ -1,6 +1,7 @@
 import { layoutLine } from "../text"
 import { codePointWidth } from "../text/width"
 import type { Direction } from "../text/bidi"
+import { LineCache } from "./lines"
 import {
 	CHAR_EMPTY,
 	CHAR_SPACE,
@@ -55,22 +56,27 @@ function allocate(cells: number): Buffer {
  *   commit()     -> swap front/back
  *
  * MEASURED on the authoritative machine (200x120, 600 frames, bun 1.4.2,
- * linux-x64), each step forced by the previous measurement:
+ * linux-x64). Each step was forced by the previous measurement:
  *   one bounding rectangle   scanned 23636 to patch 5
  *   per-row spans            scanned  8127 to patch 5
- *   steady frame with spans  scanned  4560 to patch 1, over 61 damagedRows
+ *   exact span clearing      scanned  4560 to patch 1, over 61 damagedRows
+ *   per-row diff counters    scanned     1 to patch 1, over  1 damagedRow
  *
- * The 4560 was not a real difference. A widget tree blanks its box and repaints
- * the same text every frame; the blank differs from the visible frame and the
- * repaint restores it. Spans can only widen, so they kept the width of a change
- * that no longer existed. Counters can go back down, which is why the count is
- * authoritative here and the span is only a bound on where to look.
+ * Then the stage timers said what all of that was worth:
+ *   total p50 2.254 ms | blit 0.011 | paint 2.239 | diff 0.001 | write 0.000
+ *
+ * The diff had never been the cost. Reading 23636 cells instead of 1 was real
+ * waste and it is gone, but at this grid it was one microsecond of waste. Paint
+ * is 99.3 percent of the frame, so the work moved there: see lines.ts for the
+ * content-keyed caches, and fill() below for the blank fast path.
  *
  * Nothing here allocates per cell, and the interning pools are shared by both
  * frames so ids stay valid across the blit.
  */
 export class Screen {
 	readonly pools = new Pools()
+	/** Content-keyed wrap and shape cache. Ids are pool ids, valid for the process. */
+	readonly lines = new LineCache(this.pools.chars)
 	cols: number
 	rows: number
 	private front: Buffer
@@ -146,14 +152,15 @@ export class Screen {
 		this.dBottom = -1
 	}
 
-	private touch(x: number, y: number): void {
+	/** Widen a row's damage span, registering the row once per frame. */
+	private touchSpan(y: number, min: number, max: number): void {
 		if (this.rowMax[y]! < this.rowMin[y]!) {
 			this.dirtyRows[this.dirtyCount++] = y
-			this.rowMin[y] = x
-			this.rowMax[y] = x
+			this.rowMin[y] = min
+			this.rowMax[y] = max
 		} else {
-			if (x < this.rowMin[y]!) this.rowMin[y] = x
-			if (x > this.rowMax[y]!) this.rowMax[y] = x
+			if (min < this.rowMin[y]!) this.rowMin[y] = min
+			if (max > this.rowMax[y]!) this.rowMax[y] = max
 		}
 		if (this.dTop < 0) {
 			this.dTop = y
@@ -162,6 +169,10 @@ export class Screen {
 		}
 		if (y < this.dTop) this.dTop = y
 		if (y > this.dBottom) this.dBottom = y
+	}
+
+	private touch(x: number, y: number): void {
+		this.touchSpan(y, x, x)
 	}
 
 	private write(
@@ -204,13 +215,142 @@ export class Screen {
 		if (isDiff) this.touch(x, y)
 	}
 
+	/**
+	 * Blank a rectangle.
+	 *
+	 * A widget tree blanks its box and repaints it every frame, so most fills
+	 * write a blank over a blank. That case is detected per row segment with
+	 * reads only: no writes, no counters, no damage. The general path is entered
+	 * only for segments that really change, and the visible-on-space collapse is
+	 * decided once for the whole fill instead of once per cell.
+	 */
 	fill(rect: Rect, style: Style = {}): void {
 		const styleId = this.pools.styles.intern(style)
-		for (let y = Math.max(0, rect.top); y <= Math.min(this.rows - 1, rect.bottom); y++) {
-			for (let x = Math.max(0, rect.left); x <= Math.min(this.cols - 1, rect.right); x++) {
-				this.write(x, y, CHAR_SPACE, styleId, LINK_NONE)
+		const eff = StylePool.visibleOnSpace(styleId) ? styleId : STYLE_DEFAULT
+		const top = Math.max(0, rect.top)
+		const bottom = Math.min(this.rows - 1, rect.bottom)
+		const left = Math.max(0, rect.left)
+		const right = Math.min(this.cols - 1, rect.right)
+		if (bottom < top || right < left) return
+
+		const bc = this.back.chars
+		const bs = this.back.styles
+		const bl = this.back.links
+		const fc = this.front.chars
+		const fs = this.front.styles
+		const fl = this.front.links
+
+		for (let y = top; y <= bottom; y++) {
+			const base = y * this.cols
+			const from = base + left
+			const to = base + right
+
+			let clean = true
+			for (let i = from; i <= to; i++) {
+				if (
+					bc[i] !== CHAR_SPACE ||
+					bs[i] !== eff ||
+					bl[i] !== LINK_NONE ||
+					fc[i] !== CHAR_SPACE ||
+					fs[i] !== eff ||
+					fl[i] !== LINK_NONE
+				) {
+					clean = false
+					break
+				}
+			}
+			if (clean) continue
+
+			let delta = 0
+			let min = -1
+			let max = -1
+			for (let x = left; x <= right; x++) {
+				const i = base + x
+				const frontChar = fc[i]!
+				const frontStyle = fs[i]!
+				const frontLink = fl[i]!
+				const wasDiff =
+					bc[i] !== frontChar || bs[i] !== frontStyle || bl[i] !== frontLink
+
+				bc[i] = CHAR_SPACE
+				bs[i] = eff
+				bl[i] = LINK_NONE
+
+				const isDiff =
+					frontChar !== CHAR_SPACE || frontStyle !== eff || frontLink !== LINK_NONE
+				if (isDiff !== wasDiff) delta += isDiff ? 1 : -1
+				if (isDiff) {
+					if (min < 0) min = x
+					max = x
+				}
+			}
+			if (delta !== 0) {
+				this.rowDiff[y] = this.rowDiff[y]! + delta
+				this.pendingDiffs += delta
+			}
+			if (min >= 0) this.touchSpan(y, min, max)
+		}
+	}
+
+	/**
+	 * Draw pre-interned cell ids starting at (x, y). This is the hot path for
+	 * text: no strings, no width table, no interning, one packed write per cell.
+	 * Ids come from LineCache, which already inserted continuation cells.
+	 */
+	putCells(
+		x: number,
+		y: number,
+		ids: Int32Array,
+		style: Style = {},
+		url = "",
+	): number {
+		const reach = Math.max(0, Math.min(ids.length, this.cols - x))
+		if (y < 0 || y >= this.rows || reach === 0) return reach
+
+		const styleId = this.pools.styles.intern(style)
+		const linkId = this.pools.links.intern(url)
+		const visible = StylePool.visibleOnSpace(styleId)
+		const base = y * this.cols
+		const bc = this.back.chars
+		const bs = this.back.styles
+		const bl = this.back.links
+		const fc = this.front.chars
+		const fs = this.front.styles
+		const fl = this.front.links
+
+		let delta = 0
+		let min = -1
+		let max = -1
+		let cursor = x
+		for (let k = 0; k < ids.length; k++, cursor++) {
+			if (cursor >= this.cols) break
+			if (cursor < 0) continue
+			const charId = ids[k]!
+			const eff = charId === CHAR_SPACE && !visible ? STYLE_DEFAULT : styleId
+			const i = base + cursor
+			const frontChar = fc[i]!
+			const frontStyle = fs[i]!
+			const frontLink = fl[i]!
+			const wasDiff =
+				bc[i] !== frontChar || bs[i] !== frontStyle || bl[i] !== frontLink
+
+			bc[i] = charId
+			bs[i] = eff
+			bl[i] = linkId
+
+			const isDiff = charId !== frontChar || eff !== frontStyle || linkId !== frontLink
+			if (isDiff !== wasDiff) delta += isDiff ? 1 : -1
+			if (isDiff) {
+				if (min < 0) min = cursor
+				max = cursor
 			}
 		}
+		if (delta !== 0) {
+			this.rowDiff[y] = this.rowDiff[y]! + delta
+			this.pendingDiffs += delta
+		}
+		if (min >= 0) this.touchSpan(y, min, max)
+		return cursor - x
 	}
 
 	/**

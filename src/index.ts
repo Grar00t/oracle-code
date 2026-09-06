@@ -1,29 +1,60 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // Oracle Code entry point.
 //
 //   oc "prompt"           one-shot, prints the final answer
 //   oc                    interactive session
 //   oc sessions           list session transcripts
 //   oc theme --lint FILE  report which theme keys would be ignored
+//   oc doctor             print engine, platform, shell and endpoint status
+//
+// Runs under Bun and under Node, on Linux, macOS and Windows. Anything
+// engine-specific or platform-specific lives in src/rt.
 
 import { Agent } from "./agent/loop"
 import { builtins } from "./agent/builtins"
 import { Model } from "./agent/model"
 import { Registry, type ToolContext } from "./agent/tools"
+import { nextLine, closeStdin, runtimeLabel, shellPlan, which } from "./rt/index"
 import { Checkpoints } from "./safety/checkpoints"
 import { EffectLedger } from "./safety/ledger"
 import { MODE_CYCLE, Permissions, type PermissionMode } from "./safety/permissions"
 import { Session } from "./session/jsonl"
-import { loadUserTheme, resolveTheme } from "./theme/theme"
+import { loadUserTheme, resolveTheme, themePath } from "./theme/theme"
 import { render, type AppState } from "./app"
 import { Terminal } from "./tui/terminal"
 
+/**
+ * Ask a yes/no question.
+ *
+ * Reads through the single shared stdin reader in src/rt. Two independent
+ * `for await (const line of console)` loops used to consume the same stdin
+ * iterator, so a permission prompt raised mid-turn could steal the user's next
+ * task, or the main loop could swallow the answer to "[y/N]".
+ */
 async function askYesNo(question: string): Promise<boolean> {
 	process.stdout.write(`\n${question} [y/N] `)
-	for await (const line of console) {
-		return line.trim().toLowerCase().startsWith("y")
-	}
-	return false
+	const line = await nextLine()
+	return (line ?? "").trim().toLowerCase().startsWith("y")
+}
+
+async function doctor(): Promise<void> {
+	const plan = shellPlan("echo ok")
+	const model = new Model()
+	const probe = await model.probe()
+	console.log(
+		JSON.stringify(
+			{
+				runtime: runtimeLabel(),
+				shell: { file: plan.file, name: plan.shell, args: plan.args.slice(0, -1) },
+				ripgrep: await which("rg"),
+				themePath: themePath(process.env.ORACLE_THEME ?? "user"),
+				model: { name: model.name, baseUrl: model.baseUrl },
+				endpoint: probe.ok ? "reachable" : { unreachable: probe.reason, hint: probe.hint },
+			},
+			null,
+			2,
+		),
+	)
 }
 
 async function main(): Promise<void> {
@@ -32,6 +63,11 @@ async function main(): Promise<void> {
 	if (argv[0] === "sessions") {
 		const list = await Session.list()
 		console.log(list.length ? list.join("\n") : "no sessions yet")
+		return
+	}
+
+	if (argv[0] === "doctor") {
+		await doctor()
 		return
 	}
 
@@ -63,25 +99,22 @@ async function main(): Promise<void> {
 		model: model.name,
 		baseUrl: model.baseUrl,
 		mode,
-		bun: Bun.version,
+		runtime: runtimeLabel(),
+		shell: shellPlan("true").shell,
 	})
 
 	// Find out before the first prompt, not during it. An unreachable endpoint is
 	// the most common failure on a fresh machine and it must name itself.
 	const reachable = await model.probe()
 
-	const theme = resolveTheme(
-		await loadUserTheme(`${process.env.HOME}/.oracle/themes/${process.env.ORACLE_THEME ?? "user"}.json`),
-	)
+	const theme = resolveTheme(await loadUserTheme(themePath(process.env.ORACLE_THEME ?? "user")))
 
 	const oneShot = argv.filter((a) => !a.startsWith("--")).join(" ").trim()
 
 	// One-shot mode stays line-oriented so it composes with pipes and jq.
 	if (oneShot) {
 		if (!reachable.ok) {
-			process.stderr.write(
-				`model endpoint unreachable\n  ${reachable.reason}\n  ${reachable.hint}\n`,
-			)
+			process.stderr.write(`model endpoint unreachable\n  ${reachable.reason}\n  ${reachable.hint}\n`)
 			process.exitCode = 1
 			return
 		}
@@ -98,6 +131,7 @@ async function main(): Promise<void> {
 		if (irreversible.length) {
 			process.stderr.write(`\n${irreversible.length} irreversible effect(s) recorded in .oracle/effects.jsonl\n`)
 		}
+		closeStdin()
 		return
 	}
 
@@ -112,6 +146,7 @@ async function main(): Promise<void> {
 				? `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode}${served}`
 				: `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode} \u00b7 endpoint unreachable`,
 		},
+		{ role: "notice", text: `runtime ${runtimeLabel()}` },
 	]
 	if (!reachable.ok) {
 		entries.push({ role: "notice", text: reachable.reason })
@@ -181,8 +216,10 @@ async function main(): Promise<void> {
 		},
 	})
 
-	for await (const line of console) {
-		const input = line.trim()
+	while (true) {
+		const raw = await nextLine()
+		if (raw === null) break
+		const input = raw.trim()
 		if (input === "/quit" || input === "/exit") break
 		if (input === "/mode") {
 			state.mode = permissions.cycle()
@@ -217,6 +254,7 @@ async function main(): Promise<void> {
 	}
 
 	clearInterval(spinner)
+	closeStdin()
 }
 
 await main()

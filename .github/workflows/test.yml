@@ -11,30 +11,39 @@ permissions:
 
 jobs:
   bun:
-    name: bun test + typecheck
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: bun test + typecheck (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
-      # Pinned by commit SHA: a moving tag is a supply-chain hole.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      # Installed from the official script rather than an unpinned third-party
-      # action, so there is no unpinned tag anywhere in this workflow.
-      - name: install bun
-        run: |
-          curl -fsSL https://bun.sh/install | bash
-          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
-
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: latest
       - name: versions
         run: |
           bun --version
-          uname -srm
+          node --version
+        shell: bash
+      - run: bun install
+      - run: bun test
+      - run: bun x tsc --noEmit
 
-      - name: install dependencies
-        run: bun install
-
-      - name: test
-        run: bun test
-
-      - name: typecheck
-        run: bun x tsc --noEmit
+  node:
+    name: node portability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: "22"
+      - run: npm install --no-audit --no-fund
+      - run: npm run test:node

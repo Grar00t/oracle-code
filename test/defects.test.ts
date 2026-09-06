@@ -3,6 +3,7 @@
 // does what it does; these were written first, and observed to fail first.
 
 import { describe, expect, test } from "bun:test"
+import { tmpdir } from "node:os"
 import { resolve } from "node:path"
 import { codePointWidth, stringWidth } from "../src/text/width"
 import { shapeArabic } from "../src/text/arabic"
@@ -172,7 +173,11 @@ describe("D7 a leading combining mark must not be dropped", () => {
 
 describe("D8 fork must land in the session base, not above it", () => {
 	test("three levels up from <base>/sessions/<project> overshoots", () => {
-		const base = "/home/a/work/.oracle"
+		// The base is built with resolve() rather than written as a POSIX literal.
+		// On Windows, resolve("/home/a/work/.oracle") prepends the current drive,
+		// so comparing against the raw string failed for a reason that had nothing
+		// to do with the defect this test guards.
+		const base = resolve(tmpdir(), "work", ".oracle")
 		const dir = resolve(base, "sessions", "proj")
 		expect(resolve(dir, "..", "..", "..")).not.toBe(base)
 		expect(resolve(dir, "..", "..")).toBe(base)

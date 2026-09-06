@@ -5,7 +5,7 @@
 //   oc                    interactive session
 //   oc sessions           list session transcripts
 //   oc theme --lint FILE  report which theme keys would be ignored
-//   oc lang               report the active language pack and what it is missing
+//   oc lang               report the active language and what a pack is missing
 //   oc doctor             print engine, platform, shell, language and endpoint
 //
 // Runs under Bun and under Node, on Linux, macOS and Windows. Anything
@@ -40,6 +40,29 @@ async function askYesNo(question: string): Promise<boolean> {
 	return (line ?? "").trim().toLowerCase().startsWith("y")
 }
 
+/**
+ * What to report about the language.
+ *
+ * English is compiled in and never read from disk, so naming a path for it is
+ * an invitation to create a file that will be ignored. A path is reported only
+ * when a pack was actually consulted.
+ */
+function languageReport(report: PackReport): Record<string, unknown> {
+	if (report.code === "en") {
+		return { requested: "en", active: "en", direction: direction(), source: "built in" }
+	}
+	return {
+		requested: report.code,
+		active: report.loaded ? report.code : "en",
+		direction: direction(),
+		source: report.loaded ? "pack" : "built in, pack not loaded",
+		packPath: report.path,
+		missingKeys: report.missing,
+		ignoredKeys: report.ignored,
+		...(report.reason ? { reason: report.reason } : {}),
+	}
+}
+
 /** One line describing a pack load, said out loud instead of failing quietly. */
 function packSummary(report: PackReport): string {
 	if (report.loaded) {
@@ -54,24 +77,23 @@ async function doctor(report: PackReport): Promise<void> {
 	const plan = shellPlan("echo ok")
 	const model = new Model()
 	const probe = await model.probe()
+	const rg = await which("rg")
 	console.log(
 		JSON.stringify(
 			{
 				runtime: runtimeLabel(),
 				shell: { file: plan.file, name: plan.shell, args: plan.args.slice(0, -1) },
-				ripgrep: await which("rg"),
-				language: {
-					requested: report.code,
-					active: report.loaded ? report.code : "en",
-					direction: direction(),
-					packPath: report.path,
-					missingKeys: report.missing.length,
-					ignoredKeys: report.ignored,
-					...(report.reason ? { reason: report.reason } : {}),
-				},
+				// A bare null said nothing about consequence. Search still works
+				// without ripgrep; it is just the slower path.
+				search: rg
+					? { engine: "ripgrep", path: rg }
+					: { engine: "built in scanner", note: "ripgrep not on PATH; grep is slower but works" },
+				language: languageReport(report),
 				themePath: themePath(process.env.ORACLE_THEME ?? "user"),
 				model: { name: model.name, baseUrl: model.baseUrl },
-				endpoint: probe.ok ? "reachable" : { unreachable: probe.reason, hint: probe.hint },
+				endpoint: probe.ok
+					? { reachable: true, serving: probe.models }
+					: { reachable: false, reason: probe.reason, hint: probe.hint },
 			},
 			null,
 			2,
@@ -93,21 +115,7 @@ async function main(): Promise<void> {
 	}
 
 	if (argv[0] === "lang") {
-		console.log(
-			JSON.stringify(
-				{
-					requested: langReport.code,
-					active: langReport.loaded ? langReport.code : "en",
-					direction: direction(),
-					packPath: langReport.path,
-					missingKeys: langReport.missing,
-					ignoredKeys: langReport.ignored,
-					...(langReport.reason ? { reason: langReport.reason } : {}),
-				},
-				null,
-				2,
-			),
-		)
+		console.log(JSON.stringify(languageReport(langReport), null, 2))
 		return
 	}
 

@@ -119,31 +119,65 @@ function templateKwargsFromEnv(): Record<string, unknown> {
 	return effort ? { reasoning_effort: effort } : {}
 }
 
+/**
+ * Flatten an error and everything it wraps into one searchable string.
+ *
+ * This exists because of a measured defect: on node, a refused connection
+ * arrives as `TypeError: fetch failed` and the only place ECONNREFUSED appears
+ * is `error.cause`. Reading the top-level error alone sent every network
+ * failure to the generic branch, so a dead server and a wrong path produced
+ * the same advice. The chain is walked with a depth cap and an identity set,
+ * because `cause` can be self-referential.
+ */
+export function errorSignature(error: unknown): string {
+	const seen = new Set<unknown>()
+	const parts: string[] = []
+	let node: unknown = error
+	let depth = 0
+	while (node && typeof node === "object" && !seen.has(node) && depth < 8) {
+		seen.add(node)
+		const carrier = node as { name?: string; code?: string; message?: string; cause?: unknown }
+		for (const field of [carrier.name, carrier.code, carrier.message]) {
+			if (field) parts.push(String(field))
+		}
+		node = carrier.cause
+		depth++
+	}
+	if (!parts.length) parts.push(String(error))
+	return parts.join(" ")
+}
+
 // Refused and dropped look the same to a caller that only sees "it did not
 // work", but they have opposite fixes: one is the wrong port, the other is the
-// wrong bind address. Keep them apart.
-function describeFailure(error: unknown, baseUrl: string): { reason: string; hint: string } {
-	const carrier = error as { name?: string; code?: string; message?: string } | null
-	const signature = [carrier?.name, carrier?.code, carrier?.message].filter(Boolean).join(" ")
+// wrong bind address. Keep them apart, in the verdict and in the wording.
+export function describeFailure(error: unknown, baseUrl: string): { reason: string; hint: string } {
+	const signature = errorSignature(error)
 
-	if (/timeout|timedout|abort/i.test(signature)) {
+	if (/refused|econnrefused/i.test(signature)) {
+		return {
+			reason: `${baseUrl} refused the connection`,
+			hint: "the host answered but nothing is listening on that port: compare it with the port on the server's listening line, and if the server runs inside WSL check it is still running there",
+		}
+	}
+	if (/timeout|timedout|etimedout|abort/i.test(signature)) {
 		return {
 			reason: `${baseUrl} accepted no connection before the probe timed out`,
 			hint: "the route exists but nothing answered: the server is probably bound to 127.0.0.1, so restart it with --host 0.0.0.0, or allow the port through the firewall",
 		}
 	}
-	if (/refused/i.test(signature)) {
-		return {
-			reason: `${baseUrl} refused the connection`,
-			hint: "the host is reachable but nothing is listening on that port: compare it with the port the server printed on its listening line",
-		}
-	}
-	if (/notfound|eai_again|getaddrinfo|dns/i.test(signature)) {
+	if (/notfound|enotfound|eai_again|getaddrinfo|dns/i.test(signature)) {
 		return {
 			reason: `${baseUrl} did not resolve`,
 			hint: "use a literal address: from WSL the Windows host is the default gateway, printed by ip route show default",
 		}
 	}
+	if (/certificate|self.signed|ssl|tls/i.test(signature)) {
+		return {
+			reason: `${baseUrl} failed its TLS check`,
+			hint: "a local server has no certificate worth checking: use http:// for a loopback address",
+		}
+	}
+	const carrier = error as { message?: string } | null
 	return {
 		reason: `${baseUrl} failed: ${carrier?.message ?? String(error)}`,
 		hint: "check that the server is running and that the base url ends in /v1",

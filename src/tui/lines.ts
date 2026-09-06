@@ -184,17 +184,30 @@ export class LineCache {
 		return ids
 	}
 
-	/** Clusters to cells: zero-width clusters vanish, wide ones take two cells. */
+	/**
+	 * Clusters to cells: wide clusters take two, everything else takes one.
+	 *
+	 * A cluster whose leading code point is zero-width owns no cell of its own.
+	 * Discarding it loses the character outright, which is what a line beginning
+	 * with a haraka used to do. It is held and merged into the next cluster that
+	 * does own a cell, or shown over a space if the run ends without one.
+	 */
 	private pack(cells: readonly string[]): { ids: Int32Array; width: number } {
-		const scratch = new Int32Array(cells.length * 2)
+		const scratch = new Int32Array(cells.length * 2 + 2)
 		let n = 0
+		let pending = ""
 		for (const cluster of cells) {
 			if (cluster === "") continue
 			const w = codePointWidth(cluster.codePointAt(0)!)
-			if (w === 0) continue
-			scratch[n++] = this.chars.intern(cluster)
+			if (w === 0) {
+				pending += cluster
+				continue
+			}
+			scratch[n++] = this.chars.intern(pending ? pending + cluster : cluster)
+			pending = ""
 			if (w === 2) scratch[n++] = CHAR_EMPTY
 		}
+		if (pending) scratch[n++] = this.chars.intern(` ${pending}`)
 		return { ids: n === scratch.length ? scratch : scratch.slice(0, n), width: n }
 	}
 }

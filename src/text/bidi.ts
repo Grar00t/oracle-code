@@ -12,7 +12,7 @@
 
 export type Direction = "ltr" | "rtl"
 
-type BidiClass = "L" | "R" | "EN" | "AN" | "N"
+export type BidiClass = "L" | "R" | "EN" | "AN" | "N"
 
 const MIRRORS: Record<string, string> = {
 	"(": ")",
@@ -27,20 +27,32 @@ const MIRRORS: Record<string, string> = {
 	"\u00bb": "\u00ab",
 }
 
-function classify(cp: number): BidiClass {
+/**
+ * Bidi class of a single code point.
+ *
+ * Order is load-bearing. Every Arabic-script digit and numeric separator sits
+ * inside the strong-RTL span 0x0600..0x07BF, so the numeric branches must be
+ * tested first. Testing the strong-RTL block first classifies them as R, the
+ * reordering pass then carries them into the surrounding run, and the digits of
+ * a number come out reversed.
+ */
+export function classify(cp: number): BidiClass {
+	// Numbers, before the strong-RTL block.
+	if (cp >= 0x0030 && cp <= 0x0039) return "EN" // ASCII digits
+	if (cp >= 0x0660 && cp <= 0x0669) return "AN" // Arabic-Indic digits
+	if (cp >= 0x066b && cp <= 0x066c) return "AN" // decimal, thousands separator
+	if (cp >= 0x06f0 && cp <= 0x06f9) return "AN" // extended Arabic-Indic digits
+
 	// Arabic letters and Hebrew: strong right-to-left.
 	if (
 		(cp >= 0x0590 && cp <= 0x05ff) ||
-		(cp >= 0x0600 && cp <= 0x07bf && !(cp >= 0x0660 && cp <= 0x0669)) ||
+		(cp >= 0x0600 && cp <= 0x07bf) ||
 		(cp >= 0xfb1d && cp <= 0xfdff) ||
 		(cp >= 0xfe70 && cp <= 0xfeff)
 	)
 		return "R"
 	if (cp === 0x200f) return "R" // RLM
 	if (cp === 0x200e) return "L" // LRM
-	if (cp >= 0x0660 && cp <= 0x0669) return "AN" // Arabic-Indic digits
-	if (cp >= 0x06f0 && cp <= 0x06f9) return "AN"
-	if (cp >= 0x0030 && cp <= 0x0039) return "EN"
 	if (
 		(cp >= 0x0041 && cp <= 0x005a) ||
 		(cp >= 0x0061 && cp <= 0x007a) ||
@@ -111,7 +123,7 @@ export function reorderLine(line: string, base?: Direction): string {
 	const levels = new Int32Array(chars.length)
 	for (let i = 0; i < chars.length; i++) {
 		const cls = resolved[i]!
-		if (cls === "R") levels[i] = baseLevel === 1 ? 1 : 1
+		if (cls === "R") levels[i] = 1
 		else if (cls === "L") levels[i] = baseLevel === 1 ? 2 : 0
 		else if (cls === "EN" || cls === "AN") {
 			// Number adjacent to RTL text: level+1 relative to that run.

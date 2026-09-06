@@ -5,10 +5,11 @@
 //   oc                    interactive session
 //   oc sessions           list session transcripts
 //   oc theme --lint FILE  report which theme keys would be ignored
-//   oc doctor             print engine, platform, shell and endpoint status
+//   oc doctor             print engine, platform, shell, language and endpoint
 //
 // Runs under Bun and under Node, on Linux, macOS and Windows. Anything
-// engine-specific or platform-specific lives in src/rt.
+// engine-specific or platform-specific lives in src/rt. The interface language
+// is English by default and switchable with ORACLE_LANG or /lang.
 
 import { Agent } from "./agent/loop"
 import { builtins } from "./agent/builtins"
@@ -20,6 +21,7 @@ import { EffectLedger } from "./safety/ledger"
 import { MODE_CYCLE, Permissions, type PermissionMode } from "./safety/permissions"
 import { Session } from "./session/jsonl"
 import { loadUserTheme, resolveTheme, themePath } from "./theme/theme"
+import { direction, nextLang, resolveLang, t, visual, type Lang } from "./i18n/index"
 import { render, type AppState } from "./app"
 import { Terminal } from "./tui/terminal"
 
@@ -31,13 +33,15 @@ import { Terminal } from "./tui/terminal"
  * iterator, so a permission prompt raised mid-turn could steal the user's next
  * task, or the main loop could swallow the answer to "[y/N]".
  */
-async function askYesNo(question: string): Promise<boolean> {
-	process.stdout.write(`\n${question} [y/N] `)
-	const line = await nextLine()
-	return (line ?? "").trim().toLowerCase().startsWith("y")
+function askYesNo(lang: Lang): (question: string) => Promise<boolean> {
+	return async (question: string) => {
+		process.stdout.write(`\n${visual(question, lang)} [y/N] `)
+		const line = await nextLine()
+		return (line ?? "").trim().toLowerCase().startsWith("y")
+	}
 }
 
-async function doctor(): Promise<void> {
+async function doctor(lang: Lang): Promise<void> {
 	const plan = shellPlan("echo ok")
 	const model = new Model()
 	const probe = await model.probe()
@@ -47,6 +51,7 @@ async function doctor(): Promise<void> {
 				runtime: runtimeLabel(),
 				shell: { file: plan.file, name: plan.shell, args: plan.args.slice(0, -1) },
 				ripgrep: await which("rg"),
+				language: { code: lang, direction: direction(lang) },
 				themePath: themePath(process.env.ORACLE_THEME ?? "user"),
 				model: { name: model.name, baseUrl: model.baseUrl },
 				endpoint: probe.ok ? "reachable" : { unreachable: probe.reason, hint: probe.hint },
@@ -59,15 +64,16 @@ async function doctor(): Promise<void> {
 
 async function main(): Promise<void> {
 	const argv = process.argv.slice(2)
+	let lang = resolveLang()
 
 	if (argv[0] === "sessions") {
 		const list = await Session.list()
-		console.log(list.length ? list.join("\n") : "no sessions yet")
+		console.log(list.length ? list.join("\n") : visual(t("noSessions", lang), lang))
 		return
 	}
 
 	if (argv[0] === "doctor") {
-		await doctor()
+		await doctor(lang)
 		return
 	}
 
@@ -87,7 +93,7 @@ async function main(): Promise<void> {
 	const mode: PermissionMode = modeArg && MODE_CYCLE.includes(modeArg) ? modeArg : "manual"
 
 	const session = new Session()
-	const permissions = new Permissions(mode, askYesNo)
+	const permissions = new Permissions(mode, askYesNo(lang))
 	const checkpoints = new Checkpoints(session.id)
 	const ledger = new EffectLedger(session.id)
 	const model = new Model()
@@ -99,6 +105,7 @@ async function main(): Promise<void> {
 		model: model.name,
 		baseUrl: model.baseUrl,
 		mode,
+		lang,
 		runtime: runtimeLabel(),
 		shell: shellPlan("true").shell,
 	})
@@ -114,7 +121,9 @@ async function main(): Promise<void> {
 	// One-shot mode stays line-oriented so it composes with pipes and jq.
 	if (oneShot) {
 		if (!reachable.ok) {
-			process.stderr.write(`model endpoint unreachable\n  ${reachable.reason}\n  ${reachable.hint}\n`)
+			process.stderr.write(
+				`${visual(t("endpointUnreachable", lang), lang)}\n  ${reachable.reason}\n  ${reachable.hint}\n`,
+			)
 			process.exitCode = 1
 			return
 		}
@@ -122,14 +131,18 @@ async function main(): Promise<void> {
 			onEvent: (event) => {
 				if (event.type === "token") process.stdout.write(event.text)
 				if (event.type === "tool.end")
-					process.stderr.write(`\n[${event.ok ? "ok" : "fail"}] ${event.name} ${event.durationMs.toFixed(0)}ms\n`)
+					process.stderr.write(
+						`\n[${event.ok ? "ok" : "fail"}] ${event.parallel ? "\u2225" : "\u2192"} ${event.name} ${event.durationMs.toFixed(0)}ms\n`,
+					)
 			},
 		})
 		await agent.run(oneShot)
 		process.stdout.write("\n")
 		const irreversible = ledger.irreversible()
 		if (irreversible.length) {
-			process.stderr.write(`\n${irreversible.length} irreversible effect(s) recorded in .oracle/effects.jsonl\n`)
+			process.stderr.write(
+				`\n${visual(t("irreversible", lang), lang)} ${irreversible.length} \u2014 .oracle/effects.jsonl\n`,
+			)
 		}
 		closeStdin()
 		return
@@ -138,24 +151,24 @@ async function main(): Promise<void> {
 	// Interactive mode.
 	const term = new Terminal({ alternateScreen: true })
 
-	const served = reachable.ok && reachable.models.length ? ` \u00b7 serving ${reachable.models.join(", ")}` : ""
+	const served =
+		reachable.ok && reachable.models.length
+			? ` \u00b7 ${t("serving", lang)} ${reachable.models.join(", ")}`
+			: ""
 	const entries: AppState["entries"] = [
 		{
 			role: "notice",
 			text: reachable.ok
-				? `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode}${served}`
-				: `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode} \u00b7 endpoint unreachable`,
+				? `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 ${mode}${served}`
+				: `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 ${mode} \u00b7 ${t("endpointUnreachable", lang)}`,
 		},
-		{ role: "notice", text: `runtime ${runtimeLabel()}` },
+		{ role: "notice", text: `${t("runtime", lang)} ${runtimeLabel()}` },
 	]
 	if (!reachable.ok) {
 		entries.push({ role: "notice", text: reachable.reason })
 		entries.push({ role: "notice", text: reachable.hint })
 	}
-	entries.push({
-		role: "notice",
-		text: "type a task, /mode to cycle permissions, /undo to restore, /quit to exit",
-	})
+	entries.push({ role: "notice", text: t("startupHint", lang) })
 
 	const state: AppState = {
 		entries,
@@ -163,6 +176,7 @@ async function main(): Promise<void> {
 		input: "",
 		mode,
 		model: model.name,
+		lang,
 		busy: false,
 		spinnerFrame: 0,
 		checkpoints: 0,
@@ -198,13 +212,13 @@ async function main(): Promise<void> {
 						ok: event.ok,
 						summary: "",
 						durationMs: event.durationMs,
-						parallel: false,
+						parallel: event.parallel,
 					})
 					break
 				case "compaction":
 					state.entries.push({
 						role: "notice",
-						text: `context compacted (${event.droppedToolOutputs} tool outputs elided${event.summarized ? ", summarized" : ""})`,
+						text: `${t("contextCompacted", state.lang)} (${event.droppedToolOutputs}${event.summarized ? " +" : ""})`,
 					})
 					break
 				case "turn.end":
@@ -223,7 +237,15 @@ async function main(): Promise<void> {
 		if (input === "/quit" || input === "/exit") break
 		if (input === "/mode") {
 			state.mode = permissions.cycle()
-			state.entries.push({ role: "notice", text: `permission mode: ${state.mode}` })
+			state.entries.push({ role: "notice", text: `${t("permissionMode", state.lang)}: ${state.mode}` })
+			draw()
+			continue
+		}
+		if (input === "/lang" || input.startsWith("/lang ")) {
+			const arg = input.slice(5).trim().toLowerCase()
+			lang = arg === "ar" || arg === "en" ? (arg as Lang) : nextLang(state.lang)
+			state.lang = lang
+			state.entries.push({ role: "notice", text: `${t("language", lang)}: ${lang}` })
 			draw()
 			continue
 		}
@@ -232,7 +254,7 @@ async function main(): Promise<void> {
 			state.checkpoints = checkpoints.entries().length
 			state.entries.push({
 				role: "notice",
-				text: restored ? `restored ${restored}` : "nothing to undo",
+				text: restored ? `${t("restored", state.lang)} ${restored}` : t("nothingToUndo", state.lang),
 			})
 			draw()
 			continue
@@ -245,7 +267,7 @@ async function main(): Promise<void> {
 		try {
 			await agent.run(input)
 		} catch (error) {
-			state.entries.push({ role: "notice", text: `error: ${(error as Error).message}` })
+			state.entries.push({ role: "notice", text: `${t("error", state.lang)}: ${(error as Error).message}` })
 		}
 		state.busy = false
 		state.checkpoints = checkpoints.entries().length

@@ -8,7 +8,9 @@ import { executeBatch, type Registry, type ToolContext } from "./tools"
 export type LoopEvent =
 	| { type: "token"; text: string }
 	| { type: "tool.start"; name: string; summary: string; parallel: boolean }
-	| { type: "tool.end"; name: string; ok: boolean; durationMs: number }
+	// `parallel` reports whether this call actually overlapped another. It used
+	// to be missing here, so the view had nothing to read and hard-coded false.
+	| { type: "tool.end"; name: string; ok: boolean; durationMs: number; parallel: boolean }
 	| { type: "compaction"; droppedToolOutputs: number; summarized: boolean }
 	| { type: "turn.end"; text: string }
 
@@ -112,6 +114,8 @@ export class Agent {
 					name: outcome.call.name,
 					ok: outcome.ok,
 					durationMs: outcome.durationMs,
+					// Taken from the scheduler's own record of how it ran the call.
+					parallel: outcome.parallel,
 				})
 				this.messages.push({
 					role: "tool",

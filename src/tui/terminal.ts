@@ -14,6 +14,8 @@ export type FrameRecord = {
 	patched: number
 	scanned: number
 	bytes: number
+	/** Rows that carried damage. scanned/damagedRows is the average span width. */
+	damagedRows: number
 }
 
 /**
@@ -67,6 +69,7 @@ export class Terminal {
 			patched: stats.patched,
 			scanned: stats.scanned,
 			bytes: stats.bytes,
+			damagedRows: stats.damagedRows,
 		}
 		this.records.push(record)
 		if (this.records.length > 512) this.records.shift()

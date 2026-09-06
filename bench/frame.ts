@@ -6,6 +6,7 @@
 
 import { Terminal } from "../src/tui/terminal"
 import { box, text } from "../src/tui/layout"
+import type { FrameRecord } from "../src/tui/terminal"
 
 const COLS = Number(process.env.BENCH_COLS ?? 200)
 const ROWS = Number(process.env.BENCH_ROWS ?? 120)
@@ -29,6 +30,8 @@ const lorem = Array.from({ length: 60 }, (_, i) =>
 
 const steady: number[] = []
 const streaming: number[] = []
+let steadyLast: FrameRecord | undefined
+let streamingLast: FrameRecord | undefined
 
 // Phase 1: steady state — only the spinner changes.
 for (let f = 0; f < FRAMES; f++) {
@@ -38,6 +41,7 @@ for (let f = 0; f < FRAMES; f++) {
 	])
 	const rec = term.draw(tree)
 	if (f > 5) steady.push(rec.durationMs)
+	steadyLast = rec
 }
 
 // Phase 2: token streaming — a growing line at the bottom.
@@ -48,6 +52,7 @@ for (let f = 0; f < FRAMES; f++) {
 	const tree = box([box(lorem, { grow: true }), text(buffer)])
 	const rec = term.draw(tree)
 	if (f > 5) streaming.push(rec.durationMs)
+	streamingLast = rec
 }
 
 function quantile(samples: number[], q: number): number {
@@ -72,7 +77,10 @@ const report = {
 		p95: quantile(streaming, 0.95),
 		max: Math.max(...streaming),
 	},
-	last_frame: term.telemetry().at(-1),
+	// One frame from each phase, so scanned can be read against damagedRows
+	// instead of guessing whether the cost is many rows or few wide rows.
+	steady_last_frame: steadyLast,
+	streaming_last_frame: streamingLast,
 }
 
 console.log(JSON.stringify(report, null, 2))

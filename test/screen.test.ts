@@ -66,6 +66,28 @@ describe("packed screen", () => {
 		expect(screen.lastStats.damage).toEqual({ top: 0, left: 0, bottom: 119, right: 192 })
 	})
 
+	test("a row dirtied in an earlier frame does not pay again later", () => {
+		// Spans must be cleared per row, not across the previous row range. A wide
+		// row from two frames ago must not be rescanned because a later frame's row
+		// range happens to contain it.
+		const screen = new Screen(200, 120)
+		const frame = (paint: () => void) => {
+			screen.beginFrame()
+			paint()
+			screen.render()
+			screen.commit()
+		}
+		const wide = "x".repeat(200)
+		frame(() => screen.putText(0, 60, wide))
+		frame(() => {
+			screen.putText(0, 60, wide) // identical, so row 60 stays clean
+			screen.putText(0, 0, "a")
+			screen.putText(199, 119, "b")
+		})
+		expect(screen.lastStats.damagedRows).toBe(2)
+		expect(screen.lastStats.scanned).toBeLessThanOrEqual(8)
+	})
+
 	test("synchronized output wraps every non-empty write", () => {
 		const screen = new Screen(10, 1)
 		screen.beginFrame()

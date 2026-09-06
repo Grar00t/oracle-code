@@ -1,20 +1,27 @@
 {
-  "name": "oracle-code",
-  "version": "0.1.0",
-  "description": "Local-first terminal coding agent: zero-alloc packed-cell TUI, Arabic-correct grid, JSONL sessions, lazy MCP schemas.",
-  "type": "module",
-  "bin": { "oc": "./src/index.ts" },
-  "scripts": {
-    "dev": "bun run src/index.ts",
-    "build": "bun build --compile --minify src/index.ts --outfile dist/oc",
-    "test": "bun test",
-    "bench": "bun run bench/frame.ts",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {},
-  "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "^5.6.0"
-  },
-  "engines": { "bun": ">=1.1.0" }
+	"name": "oracle-code",
+	"version": "0.2.0",
+	"type": "module",
+	"description": "A terminal coding agent that runs against a local model. Bun or Node, Linux, macOS or Windows.",
+	"bin": {
+		"oc": "./src/index.ts"
+	},
+	"scripts": {
+		"dev": "bun run src/index.ts",
+		"build": "bun build --compile --minify src/index.ts --outfile dist/oc",
+		"test": "bun test",
+		"test:node": "tsx scripts/portability.mts",
+		"bench": "bun run bench/frame.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"@types/node": "^22.10.0",
+		"tsx": "^4.19.2",
+		"typescript": "^5.6.0"
+	},
+	"engines": {
+		"bun": ">=1.1.0",
+		"node": ">=20.11.0"
+	}
 }

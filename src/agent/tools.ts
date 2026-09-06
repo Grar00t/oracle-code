@@ -48,9 +48,15 @@ export type ToolOutcome = {
 	output: string
 	durationMs: number
 	/**
-	 * Whether this call actually overlapped another one. Eligibility is not
-	 * enough: a read-only call that arrived alone ran alone, and reporting it as
-	 * parallel would make the interface claim concurrency that never happened.
+	 * How the scheduler started this call: true when it was launched together
+	 * with at least one other call, false when it ran on its own.
+	 *
+	 * The limit of this flag, stated so no reader infers more: it is the width of
+	 * the group handed to Promise.all, not a wall-clock measurement of two calls
+	 * executing in the same instant. Eligibility alone is not enough — a
+	 * read-only call that arrived alone ran alone — but a group of two whose work
+	 * is entirely synchronous would still be reported as parallel here. Observed
+	 * interleaving is proved by the scheduler tests, not by this field.
 	 */
 	parallel: boolean
 }
@@ -88,8 +94,8 @@ export class Registry {
  * executeBatch is the only caller that starts work, but it would let the
  * interface claim a call ran in parallel when it did not.
  *
- * This answers "may it overlap", which is not the same question as "did it".
- * ToolOutcome.parallel answers the second one.
+ * This answers "may it overlap", which is not the same question as "how was it
+ * started". ToolOutcome.parallel answers the second one.
  */
 export function canRunParallel(tool: Tool | undefined): boolean {
 	return Boolean(tool?.readOnly) && !tool?.quarantined
@@ -191,9 +197,9 @@ export async function executeBatch(
 				i++
 			}
 			// An eligible call that arrived alone still ran alone.
-			const overlapped = group.length > 1
+			const startedTogether = group.length > 1
 			const batch = await Promise.all(
-				group.map((c) => runOne(c, registry, ctx, overlapped)),
+				group.map((c) => runOne(c, registry, ctx, startedTogether)),
 			)
 			results.push(...batch)
 			continue

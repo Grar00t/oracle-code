@@ -66,6 +66,10 @@ async function main(): Promise<void> {
 		bun: Bun.version,
 	})
 
+	// Find out before the first prompt, not during it. An unreachable endpoint is
+	// the most common failure on a fresh machine and it must name itself.
+	const reachable = await model.probe()
+
 	const theme = resolveTheme(
 		await loadUserTheme(`${process.env.HOME}/.oracle/themes/${process.env.ORACLE_THEME ?? "user"}.json`),
 	)
@@ -74,6 +78,13 @@ async function main(): Promise<void> {
 
 	// One-shot mode stays line-oriented so it composes with pipes and jq.
 	if (oneShot) {
+		if (!reachable.ok) {
+			process.stderr.write(
+				`model endpoint unreachable\n  ${reachable.reason}\n  ${reachable.hint}\n`,
+			)
+			process.exitCode = 1
+			return
+		}
 		const agent = new Agent(model, registry, ctx, {
 			onEvent: (event) => {
 				if (event.type === "token") process.stdout.write(event.text)
@@ -92,11 +103,27 @@ async function main(): Promise<void> {
 
 	// Interactive mode.
 	const term = new Terminal({ alternateScreen: true })
+
+	const served = reachable.ok && reachable.models.length ? ` \u00b7 serving ${reachable.models.join(", ")}` : ""
+	const entries: AppState["entries"] = [
+		{
+			role: "notice",
+			text: reachable.ok
+				? `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode}${served}`
+				: `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode} \u00b7 endpoint unreachable`,
+		},
+	]
+	if (!reachable.ok) {
+		entries.push({ role: "notice", text: reachable.reason })
+		entries.push({ role: "notice", text: reachable.hint })
+	}
+	entries.push({
+		role: "notice",
+		text: "type a task, /mode to cycle permissions, /undo to restore, /quit to exit",
+	})
+
 	const state: AppState = {
-		entries: [
-			{ role: "notice", text: `oracle-code \u00b7 ${model.name} @ ${model.baseUrl} \u00b7 mode ${mode}` },
-			{ role: "notice", text: "type a task, /mode to cycle permissions, /undo to restore, /quit to exit" },
-		],
+		entries,
 		streaming: "",
 		input: "",
 		mode,

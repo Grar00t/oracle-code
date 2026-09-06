@@ -76,7 +76,14 @@ export class Registry {
 	}
 }
 
-function canRunParallel(tool: Tool | undefined): boolean {
+/**
+ * The one eligibility test for concurrency. Exported so that anything reporting
+ * a call — the view, the session record, a test — asks the scheduler instead of
+ * restating the rule. A second copy would not widen the firewall, because
+ * executeBatch is the only caller that starts work, but it would let the
+ * interface claim a call ran in parallel when it did not.
+ */
+export function canRunParallel(tool: Tool | undefined): boolean {
 	return Boolean(tool?.readOnly) && !tool?.quarantined
 }
 

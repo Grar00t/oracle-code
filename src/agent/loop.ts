@@ -3,10 +3,12 @@
 
 import { compact, messagesTokens } from "./context"
 import { Model, type Message } from "./model"
-import { executeBatch, type Registry, type ToolContext } from "./tools"
+import { canRunParallel, executeBatch, type Registry, type ToolContext } from "./tools"
 
 export type LoopEvent =
 	| { type: "token"; text: string }
+	// `parallel` here is the scheduler's eligibility test, asked before the work
+	// starts. It is a prediction, and tool.end carries what actually happened.
 	| { type: "tool.start"; name: string; summary: string; parallel: boolean }
 	// `parallel` reports whether this call actually overlapped another. It used
 	// to be missing here, so the view had nothing to read and hard-coded false.
@@ -96,12 +98,12 @@ export class Agent {
 
 			// Execute: read-only calls in parallel, mutations serially.
 			for (const call of completion.toolCalls) {
-				const tool = this.registry.get(call.name)
 				emit({
 					type: "tool.start",
 					name: call.name,
 					summary: call.arguments.slice(0, 120),
-					parallel: Boolean(tool?.readOnly && !tool?.quarantined),
+					// Ask the scheduler. Restating the rule here let the view drift.
+					parallel: canRunParallel(this.registry.get(call.name)),
 				})
 				await this.ctx.session.append("tool.call", call)
 			}

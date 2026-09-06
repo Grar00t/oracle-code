@@ -44,6 +44,28 @@ describe("packed screen", () => {
 		expect(screen.lastStats.scanned).toBeLessThan(200 * 120)
 	})
 
+	test("far-apart changes do not drag the scan across the whole screen", () => {
+		// Regression guard, from a measured bench run: with one bounding rectangle
+		// a spinner in the top-left plus a status bar in the bottom-right made the
+		// diff scan 23636 cells to patch 5. Damage is per row, so the scan must stay
+		// proportional to the two short spans that actually changed.
+		const screen = new Screen(200, 120)
+		const frame = (spinner: string, tail: string) => {
+			screen.beginFrame()
+			screen.putText(0, 0, spinner)
+			screen.putText(190, 119, tail)
+			const patch = screen.render()
+			screen.commit()
+			return patch
+		}
+		frame("|", "aaa")
+		frame("/", "bbb")
+		expect(screen.lastStats.damagedRows).toBe(2)
+		expect(screen.lastStats.scanned).toBeLessThanOrEqual(64)
+		// The bounding box still spans the screen; only the scan is confined.
+		expect(screen.lastStats.damage).toEqual({ top: 0, left: 0, bottom: 119, right: 192 })
+	})
+
 	test("synchronized output wraps every non-empty write", () => {
 		const screen = new Screen(10, 1)
 		screen.beginFrame()

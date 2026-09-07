@@ -1,13 +1,7 @@
 // Sessions as plain JSONL.
 //
-// FACT (reference tool): a text JSONL file per session holds every message, tool
-// call and result; resume, history and forking all come from it.
-//
-// Addition: payloads above a threshold are content-addressed into a blob store
-// and referenced by hash. The transcript stays small enough to inspect with jq
-// even after a session reads a 200k-line file, and replay is still exact.
-//
-// Runtime-agnostic: hashing, ids and file access go through src/rt.
+// Payloads above a threshold are content-addressed into a blob store.
+// A truncated last line is skipped on read. Resume continues seq from disk.
 
 import { readdir } from "node:fs/promises"
 import { join, resolve } from "node:path"
@@ -29,18 +23,15 @@ export type SessionRecord = {
 	seq: number
 	at: string
 	kind: RecordKind
-	/** Inline payload, or { blob: "<sha256>", bytes: n } when externalized. */
 	data: unknown
 }
 
 const INLINE_LIMIT = 4096
 
-/** Session ids become path components, so they must be legal on Windows too. */
 export function sessionIdFor(now = new Date(), token = uuid()): string {
 	return `${now.toISOString().replace(/[:.]/g, "-")}-${token.replace(/-/g, "").slice(0, 8)}`
 }
 
-/** Turn an absolute working directory into one safe path component. */
 export function projectKey(cwd = process.cwd()): string {
 	return resolve(cwd).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "")
 }
@@ -49,19 +40,28 @@ export class Session {
 	readonly id: string
 	readonly dir: string
 	readonly file: string
-	/** The store root this session was opened under: <baseDir>. */
 	readonly baseDir: string
+	readonly project: string
 	private seq = 0
+	private seqHydrated = false
 
 	constructor(opts: { id?: string; baseDir?: string; project?: string } = {}) {
 		this.id = opts.id ?? sessionIdFor()
-		const project = opts.project ?? projectKey()
+		this.project = opts.project ?? projectKey()
 		this.baseDir = resolve(opts.baseDir ?? ".oracle")
-		this.dir = resolve(this.baseDir, "sessions", project)
+		this.dir = resolve(this.baseDir, "sessions", this.project)
 		this.file = join(this.dir, `${this.id}.jsonl`)
 	}
 
+	private async hydrateSeq(): Promise<void> {
+		if (this.seqHydrated) return
+		this.seqHydrated = true
+		const records = await this.read()
+		this.seq = records.reduce((max, r) => Math.max(max, r.seq), 0)
+	}
+
 	async append(kind: RecordKind, data: unknown): Promise<SessionRecord> {
+		await this.hydrateSeq()
 		let payload = data
 		const serialized = JSON.stringify(data)
 		if (serialized.length > INLINE_LIMIT) {
@@ -80,7 +80,6 @@ export class Session {
 		return record
 	}
 
-	/** Resolve a record's payload, reading the blob store when needed. */
 	async resolve(record: SessionRecord): Promise<unknown> {
 		const data = record.data as { blob?: string }
 		if (data && typeof data === "object" && typeof data.blob === "string") {
@@ -91,21 +90,25 @@ export class Session {
 
 	async read(): Promise<SessionRecord[]> {
 		const text = await readText(this.file).catch(() => "")
-		return text
-			.split(/\r?\n/)
-			.filter(Boolean)
-			.map((line) => JSON.parse(line) as SessionRecord)
+		const records: SessionRecord[] = []
+		for (const line of text.split(/\r?\n/)) {
+			if (!line) continue
+			try {
+				const record = JSON.parse(line) as SessionRecord
+				if (typeof record.seq === "number" && typeof record.kind === "string") records.push(record)
+			} catch {
+				// A truncated last line from a killed process is not a session.
+			}
+		}
+		return records
 	}
 
-	/**
-	 * Fork the transcript up to and including `throughSeq` into a new session.
-	 *
-	 * The child must open the SAME store root, so it is passed explicitly.
-	 */
 	async fork(throughSeq: number): Promise<Session> {
 		const records = (await this.read()).filter((r) => r.seq <= throughSeq)
-		const child = new Session({ baseDir: this.baseDir })
-		await writeText(child.file, `${records.map((r) => JSON.stringify(r)).join("\n")}\n`)
+		const child = new Session({ baseDir: this.baseDir, project: this.project })
+		await writeText(child.file, records.length ? `${records.map((r) => JSON.stringify(r)).join("\n")}\n` : "")
+		child.seq = records.reduce((max, r) => Math.max(max, r.seq), 0)
+		child.seqHydrated = true
 		return child
 	}
 

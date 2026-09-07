@@ -43,13 +43,6 @@ export class Permissions {
 		return this.mode
 	}
 
-	/**
-	 * Remember a human "yes" for the rest of the session.
-	 *
-	 * Only consulted for recoverable actions. Irreversible and quarantined
-	 * tools are gated before the allowlist is read, so nothing recorded here
-	 * can ever suppress those prompts.
-	 */
 	alwaysAllow(key: string): void {
 		this.allowlist.add(key)
 	}
@@ -59,25 +52,21 @@ export class Permissions {
 		const base = { mode: this.mode, prompted: false, at }
 		const quarantined = Boolean(risk.quarantined)
 
-		// 1. A genuinely read-only tool of trusted origin has no side effect.
 		if (risk.readOnly && !quarantined)
 			return { ...base, allowed: true, reason: "read-only tool" }
 
-		// 2. Plan mode forbids side effects outright.
 		if (this.mode === "plan")
 			return { ...base, allowed: false, reason: "plan mode forbids side effects" }
 
-		// 3. The gates no convenience may outrank. Checked BEFORE the allowlist
-		//    and before full-access mode, on purpose.
 		if (risk.irreversible || quarantined) return await this.ask(tool, risk, summary, base)
 
-		// 4. Conveniences, for recoverable actions only.
 		const key = `${tool}:${summary}`
 		if (this.allowlist.has(key)) return { ...base, allowed: true, reason: "session allowlist" }
 
 		if (this.mode === "full") return { ...base, allowed: true, reason: "full-access mode" }
 
-		if (this.mode === "acceptEdits")
+		// acceptEdits names file edits, not every reversible tool.
+		if (this.mode === "acceptEdits" && (tool === "write" || tool === "edit"))
 			return { ...base, allowed: true, reason: "reversible file edit auto-approved" }
 
 		return await this.ask(tool, risk, summary, base)

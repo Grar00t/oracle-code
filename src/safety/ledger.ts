@@ -1,12 +1,10 @@
 // Effect ledger.
 //
-// The reference tool draws the right line — files are undoable, remote effects
-// are not — but it leaves the second half implicit. Here it is explicit: every
-// non-undoable action is appended to a durable ledger together with the exact
-// permission decision that allowed it. After the fact you can answer "what did
-// this agent do that I cannot take back, and who said yes".
+// The file is append-only JSONL at <baseDir>/effects.jsonl. irreversible()
+// returns this process's view after hydrate(), filtered to this session id.
+// A truncated last line is skipped, not treated as a complete effect.
 
-import { appendFile, mkdir } from "node:fs/promises"
+import { appendFile, mkdir, readFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 import type { Decision } from "./permissions"
 
@@ -14,16 +12,31 @@ export type Effect = {
 	at: string
 	sessionId: string
 	tool: string
-	/** Human-readable target: URL, host, command, table name. */
 	target: string
 	reversible: boolean
 	decision: Decision
 	resultSummary: string
 }
 
+function parseEffects(text: string): Effect[] {
+	const out: Effect[] = []
+	for (const line of text.split(/\r?\n/)) {
+		if (!line) continue
+		try {
+			const row = JSON.parse(line) as Effect
+			if (!row || typeof row.tool !== "string" || typeof row.sessionId !== "string") continue
+			out.push(row)
+		} catch {
+			// Partial write: drop the broken line.
+		}
+	}
+	return out
+}
+
 export class EffectLedger {
 	private readonly file: string
 	private readonly memory: Effect[] = []
+	private hydrated = false
 
 	constructor(
 		private readonly sessionId: string,
@@ -32,9 +45,29 @@ export class EffectLedger {
 		this.file = resolve(baseDir, "effects.jsonl")
 	}
 
+	path(): string {
+		return this.file
+	}
+
+	async hydrate(): Promise<void> {
+		if (this.hydrated) return
+		this.hydrated = true
+		let text = ""
+		try {
+			text = await readFile(this.file, "utf8")
+		} catch {
+			return
+		}
+		if (this.memory.length) return
+		for (const row of parseEffects(text)) {
+			if (row.sessionId === this.sessionId) this.memory.push(row)
+		}
+	}
+
 	async record(
 		input: Omit<Effect, "at" | "sessionId">,
 	): Promise<Effect> {
+		await this.hydrate()
 		const effect: Effect = { ...input, at: new Date().toISOString(), sessionId: this.sessionId }
 		this.memory.push(effect)
 		await mkdir(dirname(this.file), { recursive: true })
@@ -48,5 +81,13 @@ export class EffectLedger {
 
 	all(): readonly Effect[] {
 		return this.memory
+	}
+
+	static async readAll(baseDir = ".oracle"): Promise<Effect[]> {
+		try {
+			return parseEffects(await readFile(resolve(baseDir, "effects.jsonl"), "utf8"))
+		} catch {
+			return []
+		}
 	}
 }

@@ -1,23 +1,16 @@
 // Runtime layer: the only file that is allowed to know which engine and which
 // operating system we are on.
-//
-// FACT: the rest of the tree used Bun.file, Bun.write, Bun.spawn, Bun.which,
-// Bun.Glob, Bun.CryptoHasher, Bun.randomUUIDv7 and `for await (const line of
-// console)`. None of those exist under Node, and three of them (bash -lc,
-// $HOME, PATH without PATHEXT) do not exist on Windows either. Everything is
-// funnelled through here so one port covers both engines and both platforms.
 
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { constants } from "node:fs"
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { delimiter, dirname, join, resolve, sep } from "node:path"
 import { createInterface, type Interface } from "node:readline"
 
 export const isWindows = process.platform === "win32"
 
-/** Engine identity, for the session header and the status line. */
 export function runtimeLabel(): string {
 	const bunVersion = (globalThis as { Bun?: { version?: string } }).Bun?.version
 	const engine = bunVersion ? `bun ${bunVersion}` : `node ${process.versions.node}`
@@ -25,7 +18,6 @@ export function runtimeLabel(): string {
 }
 
 export function home(): string {
-	// $HOME is unset on Windows; USERPROFILE is what exists there.
 	return homedir()
 }
 
@@ -45,6 +37,43 @@ export async function writeText(path: string, data: string): Promise<void> {
 	const full = resolve(path)
 	await mkdir(dirname(full), { recursive: true })
 	await writeFile(full, data, "utf8")
+}
+
+export async function writeTextAtomic(path: string, data: string): Promise<void> {
+	const full = resolve(path)
+	await mkdir(dirname(full), { recursive: true })
+	const tmpPath = `${full}.${process.pid}.${Date.now()}.tmp`
+	await writeFile(tmpPath, data, "utf8")
+	try {
+		await rename(tmpPath, full)
+	} catch {
+		await rm(full, { force: true })
+		await rename(tmpPath, full)
+	}
+}
+
+export const SCRUBBED_ENV_KEYS = [
+	"ORACLE_API_KEY",
+	"OPENAI_API_KEY",
+	"ANTHROPIC_API_KEY",
+	"OPENROUTER_API_KEY",
+	"GROQ_API_KEY",
+	"TOGETHER_API_KEY",
+] as const
+
+export function isScrubbedEnvKey(key: string): boolean {
+	if ((SCRUBBED_ENV_KEYS as readonly string[]).includes(key)) return true
+	return /^(ORACLE|OPENAI|ANTHROPIC|OPENROUTER)_.*KEY$/i.test(key)
+}
+
+export function scrubEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const out: NodeJS.ProcessEnv = {}
+	for (const [key, value] of Object.entries(env)) {
+		if (value === undefined) continue
+		if (isScrubbedEnvKey(key)) continue
+		out[key] = value
+	}
+	return out
 }
 
 export async function appendText(path: string, data: string): Promise<void> {
@@ -74,7 +103,6 @@ export function uuid(): string {
 	return randomUUID()
 }
 
-/** Resolve an executable on PATH. Honours PATHEXT, which is why `rg` was never found on Windows. */
 export async function which(bin: string, env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
 	const pathVar = env.PATH ?? env.Path ?? ""
 	const exts = isWindows
@@ -92,22 +120,11 @@ export async function which(bin: string, env: NodeJS.ProcessEnv = process.env): 
 }
 
 export type ShellPlan = {
-	/** Executable to spawn. */
 	file: string
-	/** Full argument vector, command included. */
 	args: string[]
-	/** Human-readable shell name for the tool output header. */
 	shell: string
 }
 
-/**
- * Decide which shell runs a command. Pure, so both branches are testable from
- * either platform.
- *
- * Windows has no bash. `bash -lc` there either fails outright or silently
- * lands inside a WSL distribution with a different filesystem, which is worse
- * than failing.
- */
 export function shellPlan(
 	command: string,
 	platform: NodeJS.Platform = process.platform,
@@ -124,7 +141,6 @@ export function shellPlan(
 	}
 	if (override) return { file: override, args: ["-c", command], shell: override }
 	const shell = env.SHELL ?? "/bin/sh"
-	// Only bash and zsh accept -l with -c reliably; dash treats it differently.
 	const login = /bash|zsh/.test(shell)
 	return { file: shell, args: login ? ["-lc", command] : ["-c", command], shell }
 }
@@ -136,7 +152,6 @@ export type CaptureResult = {
 	timedOut: boolean
 }
 
-/** Spawn, capture both streams, enforce a timeout. No shell interpolation. */
 export function spawnCapture(
 	file: string,
 	args: string[],
@@ -145,7 +160,7 @@ export function spawnCapture(
 	return new Promise((resolvePromise) => {
 		const child = spawn(file, args, {
 			cwd: opts.cwd,
-			env: opts.env ?? process.env,
+			env: scrubEnv(opts.env ?? process.env),
 			windowsHide: true,
 			stdio: ["ignore", "pipe", "pipe"],
 		})
@@ -178,7 +193,6 @@ export function spawnCapture(
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".oracle"])
 
-/** Translate a glob into a regular expression over forward-slash paths. */
 export function globToRegExp(pattern: string): RegExp {
 	const p = pattern.replace(/\\/g, "/")
 	let out = "^"
@@ -225,7 +239,6 @@ async function walk(dir: string, out: string[], limit: number): Promise<void> {
 	}
 }
 
-/** Portable replacement for Bun.Glob. Returns forward-slash relative paths. */
 export async function globFiles(pattern: string, cwd: string, limit = 2000): Promise<string[]> {
 	const re = globToRegExp(pattern)
 	const files: string[] = []
@@ -244,14 +257,6 @@ export async function listFiles(dir: string, limit = 200_000): Promise<string[]>
 	await walk(resolve(dir), out, limit)
 	return out
 }
-
-// ---------------------------------------------------------------------------
-// stdin
-//
-// One reader for the whole process. Two independent `for await (const line of
-// console)` loops used to race: a permission prompt raised during a turn stole
-// the next line from the main input loop, so the answer to "[y/N]" could be
-// swallowed as a prompt, or a prompt could eat the user's next task.
 
 let iface: Interface | null = null
 let closed = false
@@ -273,7 +278,6 @@ function ensureStdin(): Interface {
 	return iface
 }
 
-/** Next line of stdin, or null at end of input. Safe to call from anywhere. */
 export function nextLine(): Promise<string | null> {
 	if (queued.length) return Promise.resolve(queued.shift()!)
 	if (closed) return Promise.resolve(null)
@@ -286,7 +290,6 @@ export function closeStdin(): void {
 	iface = null
 }
 
-/** Test seam: feed lines without a real terminal. */
 export function __pushLine(line: string): void {
 	const waiter = waiting.shift()
 	if (waiter) waiter(line)

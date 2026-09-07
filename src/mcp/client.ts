@@ -14,7 +14,7 @@
 // as `npx ...` and on Windows that is npx.cmd, not npx.
 
 import { spawn, type ChildProcess } from "node:child_process"
-import { isWindows, which } from "../rt/index"
+import { isWindows, scrubEnv, which } from "../rt/index"
 import type { Tool } from "../agent/tools"
 
 type JsonRpcId = number
@@ -55,19 +55,13 @@ export class McpClient {
 		this.exitReason = null
 		this.proc = spawn(file, this.command.slice(1), {
 			stdio: ["pipe", "pipe", "inherit"],
-			env: { ...process.env, ...this.env },
+			env: { ...scrubEnv(process.env), ...this.env },
 			windowsHide: true,
-			// .cmd and .bat shims are not executable images on Windows.
 			shell: isWindows && /\.(cmd|bat)$/i.test(file),
 		})
-		// A dead child turns the next write into an EPIPE error event; unhandled,
-		// that kills the whole CLI instead of failing one tool call.
 		this.proc.stdin?.on("error", () => undefined)
 		this.proc.stdout?.setEncoding("utf8")
 		this.proc.stdout?.on("data", (chunk: string) => this.consume(chunk))
-		// A server that dies must fail its in-flight requests immediately. Waiting
-		// for the 30s timeout made a dead server look like a slow one, and every
-		// later call queued behind it.
 		this.proc.on("error", (error) => this.failAll(`spawn failed: ${(error as Error).message}`))
 		this.proc.on("exit", (code, signal) =>
 			this.failAll(`server exited (code ${code ?? "null"}${signal ? `, signal ${signal}` : ""})`),
@@ -80,7 +74,6 @@ export class McpClient {
 		this.notify("notifications/initialized", {})
 	}
 
-	/** Exposed for tests: feed raw stdout text. */
 	consume(chunk: string): void {
 		this.buffer += chunk
 		const lines = this.buffer.split("\n")
@@ -102,7 +95,6 @@ export class McpClient {
 		}
 	}
 
-	/** Exposed for tests: fail every in-flight request with one reason. */
 	failAll(reason: string): void {
 		this.exitReason = reason
 		const entries = [...this.pending.entries()]
@@ -141,7 +133,6 @@ export class McpClient {
 		return promise
 	}
 
-	/** Full tool list, cached. Never handed to the model as-is. */
 	async catalog(): Promise<McpToolInfo[]> {
 		if (this.catalogCache) return this.catalogCache
 		await this.start()
@@ -150,7 +141,6 @@ export class McpClient {
 		return this.catalogCache
 	}
 
-	/** Names and one-line descriptions: the only thing that costs context. */
 	async index(): Promise<Array<{ name: string; description: string }>> {
 		return (await this.catalog()).map((t) => ({
 			name: `${this.serverName}__${t.name}`,
@@ -181,15 +171,6 @@ export class McpClient {
 	}
 }
 
-/**
- * Wrap MCP tools as agent tools. Schemas are resolved on first call, so a large
- * server costs a few hundred context tokens instead of tens of thousands.
- *
- * The resolved schema is written back onto the tool's `parameters`, so the
- * second turn advertises the real shape instead of an empty object. Previously
- * it was assigned to a local and never read, which meant the fetch was pure
- * cost: the model never saw a schema at all.
- */
 export async function mcpTools(client: McpClient): Promise<Tool[]> {
 	const catalog = await client.catalog()
 	return catalog.map((info) => {
@@ -198,11 +179,9 @@ export async function mcpTools(client: McpClient): Promise<Tool[]> {
 		const tool: Tool = {
 			name: `${client.serverName}__${info.name}`,
 			description: (info.description ?? "").split("\n")[0]!.slice(0, 200),
-			// Placeholder until first use; the real schema is fetched lazily.
 			parameters: { type: "object", properties: {}, additionalProperties: true },
 			readOnly: declaredReadOnly,
 			irreversible: info.annotations?.destructiveHint === true,
-			// Undeclared hints mean untrusted: serial and always prompted.
 			quarantined: info.annotations?.readOnlyHint === undefined,
 			summarize: (args) => `${client.serverName}/${info.name} ${JSON.stringify(args).slice(0, 120)}`,
 			async run(args) {

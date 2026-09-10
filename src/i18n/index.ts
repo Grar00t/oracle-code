@@ -38,6 +38,7 @@ export type StringKey =
 	| "restored"
 	| "nothingToUndo"
 	| "contextCompacted"
+	| "filler"
 	| "error"
 	| "language"
 	| "noSessions"
@@ -60,6 +61,7 @@ const EN: Record<StringKey, string> = {
 	restored: "restored",
 	nothingToUndo: "nothing to undo",
 	contextCompacted: "context compacted",
+	filler: "filler",
 	error: "error",
 	language: "language",
 	noSessions: "no sessions yet",

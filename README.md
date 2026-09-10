@@ -47,6 +47,9 @@ This repo implements that pipeline directly and adds the parts the reference too
 | Frame telemetry | Internal | Every frame's damage area, patch bytes and duration is appendable to the session JSONL — measurement is a product feature, not a guess |
 | Irreversible effects | File checkpoints; remote effects governed by permissions (FACT) | Same split, made explicit: a persisted effect ledger records every non-undoable action with the permission decision that allowed it |
 | MCP schemas | Deferred, loaded on demand (FACT) | Deferred plus a capability firewall: a server must declare `readOnlyHint` to be eligible for parallel execution, and unknown tools are quarantined until approved |
+| Input | Raw-mode line editor (DERIVED) | Raw-mode key parser and line editor implemented in the open: cursor movement, ^A/^E/^U/^K/^W, ↑/↓ history persisted through the session JSONL, `"""` multiline blocks, PageUp/PageDown scrollback |
+| Language intelligence | Vendor LSP integration (DERIVED) | A ~200-line JSON-RPC/stdio LSP client, zero dependencies: `diagnostics`, `definition`, `references`, `symbols`, `rename` tools when `typescript-language-server`, `pyright-langserver`, `rust-analyzer` or `gopls` is on PATH; diagnostics are injected into every `write`/`edit` result so the model sees breakage in the same turn that caused it |
+| Filler | UNKNOWN | The system prompt forbids preamble and pleasantries, `max_tokens` (ORACLE_MAX_ANSWER_TOKENS) enforces a hard cap, and a post-turn detector records every filler hit in the session JSONL and counts it on the status line — measured, not assumed |
 
 ## Model endpoint and egress
 
@@ -58,19 +61,20 @@ answered, and what it is serving.
 ## Layout
 
 ```
-src/tui/        pools, packed screen, damage diff, optimizer, ANSI writer, layout, widgets
+src/tui/        pools, packed screen, damage diff, optimizer, ANSI writer, layout, widgets, key parser, line editor, code highlighting
 src/text/       width table, Arabic shaping, bidi reordering
-src/agent/      context -> execute -> verify loop, tool registry and scheduler
+src/agent/      context -> execute -> verify loop, tool registry and scheduler, LSP tools, filler detector
+src/lsp/        raw JSON-RPC/stdio LSP client, server registry, workspace-edit application
 src/session/    append-only JSONL sessions, resume and fork
 src/safety/     checkpoints, effect ledger, permission modes
 src/mcp/        stdio MCP client with lazy schema loading
 src/theme/      built-in themes, COLORFGBG auto-detection, user JSON overrides
 src/i18n/       English strings, optional user pack, pack validation
-src/rt/         runtime layer: paths, spawn, shell plan, file scan — Bun and Node, Linux and Windows
+src/rt/         runtime layer: paths, spawn, shell plan, file scan, raw stdin — Bun and Node, Linux and Windows
 src/app.ts      wiring: model, tools, screen, session, permissions
 src/index.ts    CLI entry: oc, doctor, lang, sessions, theme --lint
 bench/frame.ts  raw frame samples, the only authorized source of performance numbers
-test/           11 files
+test/           14 files
 ```
 
 ## Run
@@ -90,9 +94,9 @@ npx tsx src/index.ts doctor
 ```
 
 `oc doctor` is the first thing to run on a new machine. It reports the runtime, the resolved shell
-plan, whether ripgrep is on PATH, the active language and where it came from, the theme path, and
-whether the model endpoint answered — and if it did not, it names the reason rather than the
-symptom.
+plan, whether ripgrep is on PATH, which language servers are on PATH, the active language and where
+it came from, the theme path, and whether the model endpoint answered — and if it did not, it names
+the reason rather than the symptom.
 
 ## What runs on every push
 

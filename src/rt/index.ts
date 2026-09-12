@@ -296,3 +296,52 @@ export function __pushLine(line: string): void {
 export function __pendingReaders(): number {
 	return waiting.length
 }
+
+// ---------------------------------------------------------------------------
+// raw stdin
+//
+// Interactive mode needs keystrokes, not lines. Raw mode and the line reader
+// above cannot share stdin: whichever attaches first would eat the other's
+// bytes. The rule is exclusive ownership — enableRawInput refuses to start
+// while the line interface exists, and nextLine returns end-of-input while raw
+// mode holds stdin. One reader at a time, enforced here rather than hoped for.
+
+let rawListener: ((chunk: Buffer | string) => void) | null = null
+
+export function rawInputActive(): boolean {
+	return rawListener !== null
+}
+
+/**
+ * Switch stdin to keystroke delivery. Returns false when the line reader
+ * already owns stdin. The caller receives raw chunks; parsing them into keys
+ * is the terminal layer's job, not the runtime's.
+ */
+export function enableRawInput(onData: (chunk: string) => void, onEnd?: () => void): boolean {
+	if (iface || rawListener) return false
+	const stdin = process.stdin
+	rawListener = (chunk: Buffer | string) => {
+		onData(typeof chunk === "string" ? chunk : chunk.toString("utf8"))
+	}
+	if (stdin.isTTY) stdin.setRawMode?.(true)
+	stdin.resume()
+	stdin.on("data", rawListener)
+	// Piped stdin ends; a TTY does not. Without this, `echo task | oc` hangs
+	// after the last byte.
+	if (onEnd) stdin.once("end", onEnd)
+	return true
+}
+
+export function disableRawInput(): void {
+	if (!rawListener) return
+	const stdin = process.stdin
+	stdin.off("data", rawListener)
+	if (stdin.isTTY) stdin.setRawMode?.(false)
+	stdin.pause()
+	rawListener = null
+}
+
+/** Test seam: feed raw bytes as if typed. */
+export function __pushRaw(chunk: string): void {
+	rawListener?.(chunk)
+}

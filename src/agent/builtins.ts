@@ -18,12 +18,31 @@ import {
 	writeText,
 } from "../rt/index"
 import type { Tool } from "./tools"
+import { diagnosticsFor, specForPath } from "../lsp/index"
 
 const MAX_OUTPUT = 30_000
 
 function clip(text: string): string {
 	if (text.length <= MAX_OUTPUT) return text
 	return `${text.slice(0, MAX_OUTPUT)}\n... [truncated ${text.length - MAX_OUTPUT} bytes]`
+}
+
+/**
+ * Diagnostics appended to a write/edit result, so the model sees the breakage
+ * in the same tool output that caused it instead of guessing. Guarded: a file
+ * with no server on PATH costs nothing, and a slow server is cut off by the
+ * timeout rather than stalling the turn.
+ */
+async function verifyAfterMutation(path: string, cwd: string): Promise<string> {
+	if (!specForPath(path)) return ""
+	try {
+		const lines = await diagnosticsFor(path, cwd, 4000)
+		if (lines === null) return ""
+		if (lines.length === 0) return "\ndiagnostics: clean"
+		return `\ndiagnostics:\n${lines.slice(0, 20).join("\n")}`
+	} catch {
+		return ""
+	}
 }
 
 export const readFile: Tool = {
@@ -132,7 +151,8 @@ export const writeFile: Tool = {
 		const checkpoint = await ctx.checkpoints.snapshot(path, "write")
 		await ctx.session.append("checkpoint", checkpoint)
 		await writeText(path, args.content)
-		return `wrote ${args.path} (checkpoint #${checkpoint.seq})`
+		const verdict = await verifyAfterMutation(path, ctx.cwd)
+		return `wrote ${args.path} (checkpoint #${checkpoint.seq})${verdict}`
 	},
 }
 
@@ -164,7 +184,8 @@ export const editFile: Tool = {
 			? before.split(args.oldString).join(args.newString)
 			: before.replace(args.oldString, args.newString)
 		await writeText(path, after)
-		return `edited ${args.path} (${occurrences} occurrence(s), checkpoint #${checkpoint.seq})`
+		const verdict = await verifyAfterMutation(path, ctx.cwd)
+		return `edited ${args.path} (${occurrences} occurrence(s), checkpoint #${checkpoint.seq})${verdict}`
 	},
 }
 

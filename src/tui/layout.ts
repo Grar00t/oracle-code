@@ -45,7 +45,19 @@ export type BoxNode = {
 
 export type SpacerNode = { kind: "spacer"; size?: number; grow?: boolean }
 
-export type Node = TextNode | BoxNode | SpacerNode
+/**
+ * One visual line built from styled runs. No wrapping, no reordering: the
+ * caller has already decided what goes on the line — code highlighting needs
+ * exactly that, since a wrapped or reordered token is no longer the token.
+ */
+export type SpansNode = {
+	kind: "spans"
+	spans: Array<{ text: string; style?: Style }>
+	/** Style used to fill the rest of the row, so a code background spans the box. */
+	fill?: Style
+}
+
+export type Node = TextNode | BoxNode | SpacerNode | SpansNode
 
 export const text = (t: string, style?: Style, extra?: Partial<TextNode>): TextNode => ({
 	kind: "text",
@@ -63,6 +75,11 @@ export const box = (children: Node[], props: Omit<BoxNode, "kind" | "children"> 
 
 export const spacer = (size = 1): SpacerNode => ({ kind: "spacer", size })
 
+export const spans = (
+	runs: Array<{ text: string; style?: Style }>,
+	fill?: Style,
+): SpansNode => ({ kind: "spans", spans: runs, fill })
+
 function measureHeight(node: Node, width: number): number {
 	switch (node.kind) {
 		case "text": {
@@ -72,6 +89,8 @@ function measureHeight(node: Node, width: number): number {
 		}
 		case "spacer":
 			return node.size ?? 1
+		case "spans":
+			return 1
 		case "box": {
 			if (node.height !== undefined) return node.height
 			const pad = (node.padding ?? 0) + (node.border ? 1 : 0)
@@ -110,6 +129,23 @@ export function paint(
 	switch (node.kind) {
 		case "spacer":
 			return
+
+		case "spans": {
+			// Left-to-right styled runs, clipped at the box edge. run() interns
+			// without shaping: code must render exactly the bytes it holds.
+			let cursor = x
+			for (const span of node.spans) {
+				if (cursor >= x + width) break
+				const ids = screen.lines.run(span.text)
+				const room = x + width - cursor
+				const clipped = ids.length > room ? ids.slice(0, room) : ids
+				cursor += screen.putCells(cursor, y, clipped, span.style)
+			}
+			if (cursor <= x + width - 1) {
+				screen.fill({ top: y, bottom: y, left: cursor, right: x + width - 1 }, node.fill ?? {})
+			}
+			return
+		}
 
 		case "text": {
 			const lines = node.wrap === false ? [node.text] : wrapCached(node.text, width)

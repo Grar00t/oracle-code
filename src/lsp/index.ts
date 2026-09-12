@@ -133,17 +133,34 @@ export async function diagnosticsFor(
 
 type Location = { uri?: string; range?: { start?: { line?: number; character?: number } } }
 
+// Slash-normalized absolute path in URL form: backslashes become slashes and
+// a drive-letter path gains the leading slash a file URL pathname carries, so
+// "/repo" and "D:\\repo" both compare against a URI's decoded pathname.
+function toUrlPath(path: string): string {
+	const slashed = path.replace(/\\/g, "/")
+	return slashed.startsWith("/") ? slashed : `/${slashed}`
+}
+
 export function formatLocations(raw: unknown, rootDir: string): string[] {
 	const list: Location[] = Array.isArray(raw) ? raw : raw ? [raw as Location] : []
-	const rootUri = toUri(rootDir)
+	const rootPath = toUrlPath(rootDir).replace(/\/+$/, "")
 	return list.map((loc) => {
 		const target = (loc as { targetUri?: string }).targetUri ?? loc.uri ?? ""
 		const range =
 			(loc as { targetRange?: Location["range"] }).targetRange ?? loc.range ?? undefined
 		const line = (range?.start?.line ?? 0) + 1
 		const col = (range?.start?.character ?? 0) + 1
-		const rel = target.startsWith(rootUri) ? target.slice(rootUri.length + 1) : target
-		return `${decodeURIComponent(rel)}:${line}:${col}`
+		let rel = decodeURIComponent(target)
+		if (target.startsWith("file://")) {
+			try {
+				const path = decodeURIComponent(new URL(target).pathname)
+				if (path.toLowerCase().startsWith(`${rootPath.toLowerCase()}/`))
+					rel = path.slice(rootPath.length + 1)
+			} catch {
+				// malformed URI: fall through with the decoded target as-is
+			}
+		}
+		return `${rel}:${line}:${col}`
 	})
 }
 

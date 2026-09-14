@@ -133,17 +133,36 @@ export async function diagnosticsFor(
 
 type Location = { uri?: string; range?: { start?: { line?: number; character?: number } } }
 
+/**
+ * A file URI reduced to a comparable posix-style path. Pure string work, no
+ * pathToFileURL: that injects the process drive letter on Windows and breaks
+ * prefix matching against posix roots.
+ */
+function uriToComparablePath(uri: string): string {
+	let path = uri.replace(/\\/g, "/")
+	if (uri.startsWith("file://")) {
+		path = decodeURIComponent(uri.slice("file://".length))
+		path = path.replace(/^\/+/, "/")
+		// file:///D:/x carries the drive after the leading slash.
+		if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1)
+	}
+	// Drive letters compare equal regardless of case.
+	if (/^[A-Za-z]:/.test(path)) path = path.charAt(0).toLowerCase() + path.slice(1)
+	return path
+}
+
 export function formatLocations(raw: unknown, rootDir: string): string[] {
 	const list: Location[] = Array.isArray(raw) ? raw : raw ? [raw as Location] : []
-	const rootUri = toUri(rootDir)
+	const root = uriToComparablePath(rootDir).replace(/\/+$/, "")
 	return list.map((loc) => {
 		const target = (loc as { targetUri?: string }).targetUri ?? loc.uri ?? ""
 		const range =
 			(loc as { targetRange?: Location["range"] }).targetRange ?? loc.range ?? undefined
 		const line = (range?.start?.line ?? 0) + 1
 		const col = (range?.start?.character ?? 0) + 1
-		const rel = target.startsWith(rootUri) ? target.slice(rootUri.length + 1) : target
-		return `${decodeURIComponent(rel)}:${line}:${col}`
+		const path = uriToComparablePath(target)
+		const rel = path.startsWith(root + "/") ? path.slice(root.length + 1) : path
+		return `${rel}:${line}:${col}`
 	})
 }
 

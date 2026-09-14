@@ -38,6 +38,7 @@ export type StringKey =
 	| "restored"
 	| "nothingToUndo"
 	| "contextCompacted"
+	| "filler"
 	| "error"
 	| "language"
 	| "noSessions"
@@ -52,7 +53,7 @@ const EN: Record<StringKey, string> = {
 	prompt: "\u276f",
 	askLabel: "ask",
 	footer: "enter send \u00b7 tab mode \u00b7 ^z undo",
-	startupHint: "type a task, /mode to cycle permissions, /lang to reload the language pack, /undo to restore, /quit to exit",
+	startupHint: 'type a task, """ for a multiline block, pgup/pgdn to scroll, /mode to cycle permissions, /lang to reload the language pack, /undo to restore, /quit to exit',
 	runtime: "runtime",
 	endpointUnreachable: "endpoint unreachable",
 	serving: "serving",
@@ -60,6 +61,7 @@ const EN: Record<StringKey, string> = {
 	restored: "restored",
 	nothingToUndo: "nothing to undo",
 	contextCompacted: "context compacted",
+	filler: "filler",
 	error: "error",
 	language: "language",
 	noSessions: "no sessions yet",

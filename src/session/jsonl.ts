@@ -22,6 +22,7 @@ export type RecordKind =
 	| "compaction"
 	| "permission"
 	| "checkpoint"
+	| "filler"
 	| "frame"
 	| "error"
 

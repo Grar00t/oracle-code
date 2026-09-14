@@ -28,6 +28,8 @@ export type Palette = {
 	diffAdded: string
 	diffRemoved: string
 	userMessageBackground: string
+	/** Background for fenced code blocks in assistant output. */
+	codeBackground: string
 	border: string
 	/** Distinct colours for parallel sub-agent output. */
 	subagents: string[]
@@ -47,6 +49,7 @@ const DARK: Palette = {
 	diffAdded: "#14532d",
 	diffRemoved: "#7f1d1d",
 	userMessageBackground: "#1e1b4b",
+	codeBackground: "#18181b",
 	border: "#3f3f46",
 	subagents: ["#f472b6", "#facc15", "#4ade80", "#38bdf8", "#a78bfa", "#fb923c", "#2dd4bf", "#e879f9"],
 	rainbow: ["#f87171", "#fb923c", "#facc15", "#4ade80", "#38bdf8", "#818cf8", "#c084fc"],
@@ -61,6 +64,7 @@ const LIGHT: Palette = {
 	diffAdded: "#dcfce7",
 	diffRemoved: "#fee2e2",
 	userMessageBackground: "#eef2ff",
+	codeBackground: "#f4f4f5",
 	border: "#d4d4d8",
 }
 

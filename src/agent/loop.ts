@@ -2,6 +2,7 @@
 // a turn with no tool calls.
 
 import { compact, messagesTokens } from "./context"
+import { detectFiller, restatesQuestion, type FillerHit } from "./filler"
 import { Model, type Message } from "./model"
 import { canRunParallel, executeBatch, type Registry, type ToolContext } from "./tools"
 
@@ -12,8 +13,13 @@ export type LoopEvent =
 	| { type: "tool.start"; name: string; summary: string; parallel: boolean }
 	// `parallel` reports whether this call actually overlapped another. It used
 	// to be missing here, so the view had nothing to read and hard-coded false.
-	| { type: "tool.end"; name: string; ok: boolean; durationMs: number; parallel: boolean }
+	// `preview` carries the first lines of output so the interface can show what
+	// a call produced, not just that it ran.
+	| { type: "tool.end"; name: string; ok: boolean; durationMs: number; parallel: boolean; preview: string }
 	| { type: "compaction"; droppedToolOutputs: number; summarized: boolean }
+	// The filler detector's verdict on the reply that just ended. Recorded in
+	// the session JSONL either way; emitted only when something was found.
+	| { type: "filler"; hits: FillerHit[] }
 	| { type: "turn.end"; text: string }
 
 export type LoopOptions = {
@@ -30,6 +36,12 @@ export const DEFAULT_SYSTEM_PROMPT = [
 	"- Tag claims: FACT when verified from a file or command output, DERIVED when inferred, UNKNOWN when unverified. Never present UNKNOWN as FACT.",
 	"- Never state a performance number you did not measure in this session.",
 	"- Stop and report when a step needs a decision you cannot verify.",
+	"No filler:",
+	"- Start every reply with the content. No preamble, no greeting, no 'Certainly'.",
+	"- Never restate the question or announce what you are about to do; do it.",
+	"- Never repeat tool output the user already saw; reference it.",
+	"- No closing pleasantries: no 'hope this helps', no 'let me know'.",
+	"- One-line answers for one-line questions. Length must follow content, not habit.",
 ].join("\n")
 
 export class Agent {
@@ -92,6 +104,14 @@ export class Agent {
 			// Verify: no tool calls means the turn is finished.
 			if (completion.toolCalls.length === 0) {
 				finalText = completion.text
+				// Measure the reply against the no-filler contract and record the
+				// verdict. A hit is a data point in the transcript, not a retry.
+				const hits = detectFiller(finalText)
+				if (restatesQuestion(userInput, finalText)) {
+					hits.push({ pattern: "restates-question", excerpt: finalText.trimStart().slice(0, 60) })
+				}
+				await this.ctx.session.append("filler", { hits })
+				if (hits.length) emit({ type: "filler", hits })
 				emit({ type: "turn.end", text: finalText })
 				return finalText
 			}
@@ -118,6 +138,7 @@ export class Agent {
 					durationMs: outcome.durationMs,
 					// Taken from the scheduler's own record of how it ran the call.
 					parallel: outcome.parallel,
+					preview: outcome.output.split("\n").slice(0, 2).join("\n").slice(0, 200),
 				})
 				this.messages.push({
 					role: "tool",

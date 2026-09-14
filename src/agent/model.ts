@@ -36,6 +36,8 @@ export type ModelConfig = {
 	contextTokens?: number
 	/** Sent as chat_template_kwargs, e.g. { reasoning_effort: "low" }. */
 	chatTemplateKwargs?: Record<string, unknown>
+	/** Hard cap on completion length, sent upstream as max_tokens. 0 disables. */
+	maxAnswerTokens?: number
 	/** Abort a completion after this many ms. 0 disables the cap. */
 	requestTimeoutMs?: number
 	/** Abort the reachability probe after this many ms. */
@@ -188,6 +190,8 @@ export class Model {
 	readonly baseUrl: string
 	readonly name: string
 	readonly contextTokens: number
+	/** Answer cap, 0 when uncapped. Public so the status line can show it. */
+	readonly maxAnswerTokens: number
 	private readonly apiKey: string | undefined
 	private readonly temperature: number
 	private readonly chatTemplateKwargs: Record<string, unknown>
@@ -204,6 +208,7 @@ export class Model {
 		this.apiKey = cfg.apiKey ?? process.env.ORACLE_API_KEY
 		this.temperature = cfg.temperature ?? 0.2
 		this.contextTokens = cfg.contextTokens ?? Number(process.env.ORACLE_CONTEXT ?? 32768)
+		this.maxAnswerTokens = cfg.maxAnswerTokens ?? Number(process.env.ORACLE_MAX_ANSWER_TOKENS ?? 0)
 		this.chatTemplateKwargs = cfg.chatTemplateKwargs ?? templateKwargsFromEnv()
 		this.requestTimeoutMs = cfg.requestTimeoutMs ?? 0
 		this.probeTimeoutMs = cfg.probeTimeoutMs ?? 3000
@@ -267,6 +272,9 @@ export class Model {
 			messages: wire(messages),
 			temperature: this.temperature,
 			stream: true,
+			// A prompt asks for brevity; max_tokens enforces it. The model cannot
+			// pad past a cap the server applies.
+			...(this.maxAnswerTokens > 0 ? { max_tokens: this.maxAnswerTokens } : {}),
 			...(Object.keys(this.chatTemplateKwargs).length
 				? { chat_template_kwargs: this.chatTemplateKwargs }
 				: {}),

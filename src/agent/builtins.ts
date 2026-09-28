@@ -1,117 +1,75 @@
-// Built-in tools: file operations, search, execution.
-//
-// Runtime-agnostic: every filesystem, process, hash and shell call goes through
-// src/rt, so the same code runs under Bun and Node, on Linux and on Windows.
-// Search prefers ripgrep when it is on PATH (PATHEXT included, which is how it
-// is found on Windows at all) and falls back to a portable walk.
-
-import { relative, resolve } from "node:path"
-import {
-	globFiles as rtGlob,
-	listFiles,
-	readText,
-	remove,
-	shellPlan,
-	spawnCapture,
-	toPosix,
-	which,
-	writeText,
-} from "../rt/index"
+// Built-in tools. Successful calls return text; failures throw so the scheduler
+// cannot turn a failed edit or nonzero process exit into an ok:true outcome.
+// File tools are workspace-scoped. Shell and MCP still require their own trust
+// boundary and are not sandboxed by these filesystem checks.
+import { relative } from "node:path"
+import { globToRegExp, readText, shellPlan, spawnCapture, toPosix, which, writeText } from "../rt/index"
+import { workspaceFiles, workspacePath } from "../safety/paths"
 import type { Tool } from "./tools"
 
 const MAX_OUTPUT = 30_000
-
 function clip(text: string): string {
-	if (text.length <= MAX_OUTPUT) return text
-	return `${text.slice(0, MAX_OUTPUT)}\n... [truncated ${text.length - MAX_OUTPUT} bytes]`
+	return text.length <= MAX_OUTPUT ? text : `${text.slice(0, MAX_OUTPUT)}\n... [truncated ${text.length - MAX_OUTPUT} characters]`
+}
+function requireText(value: unknown, name: string): string {
+	if (typeof value !== "string") throw new Error(`${name} must be a string`)
+	return value
 }
 
 export const readFile: Tool = {
 	name: "read",
-	description: "Read a UTF-8 file. Optionally start at a 1-based line and limit the line count.",
+	description: "Read a UTF-8 file inside the workspace. Optional 1-based lineStart and lineCount.",
 	readOnly: true,
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string" },
-			lineStart: { type: "number" },
-			lineCount: { type: "number" },
-		},
-		required: ["path"],
-	},
+	parameters: { type: "object", properties: { path: { type: "string" }, lineStart: { type: "number" }, lineCount: { type: "number" } }, required: ["path"] },
 	summarize: (a) => `read ${a.path}`,
 	async run(args, ctx) {
-		const path = resolve(ctx.cwd, args.path)
-		const text = await readText(path)
-		// Windows files arrive with CRLF; splitting on \n alone left a \r on every
-		// line, which then reached the grid as a control character.
-		const lines = text.split(/\r?\n/)
+		const path = await workspacePath(ctx.cwd, args.path)
+		const lines = (await readText(path)).split(/\r?\n/)
 		const start = Math.max(1, args.lineStart ?? 1)
 		const count = args.lineCount ?? lines.length
-		const slice = lines.slice(start - 1, start - 1 + count)
-		return clip(slice.map((l, i) => `${start + i}\t${l}`).join("\n"))
+		if (!Number.isSafeInteger(start) || !Number.isSafeInteger(count) || count < 0)
+			throw new Error("line range must contain nonnegative integers")
+		return clip(lines.slice(start - 1, start - 1 + count).map((line, i) => `${start + i}\t${line}`).join("\n"))
 	},
 }
 
 export const globFiles: Tool = {
 	name: "glob",
-	description: "List files matching a glob pattern, relative to the working directory.",
+	description: "List workspace files matching a glob. Does not follow directory symlinks.",
 	readOnly: true,
-	parameters: {
-		type: "object",
-		properties: { pattern: { type: "string" } },
-		required: ["pattern"],
-	},
+	parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] },
 	summarize: (a) => `glob ${a.pattern}`,
 	async run(args, ctx) {
-		const hits = await rtGlob(args.pattern, ctx.cwd)
-		return clip(hits.join("\n") || "(no matches)")
+		const re = globToRegExp(requireText(args.pattern, "pattern"))
+		const root = await workspacePath(ctx.cwd, ".")
+		const hits = (await workspaceFiles(ctx.cwd)).map((file) => toPosix(relative(root, file))).filter((file) => re.test(file))
+		return clip(hits.sort().join("\n") || "(no matches)")
 	},
 }
 
 export const grepFiles: Tool = {
 	name: "grep",
-	description: "Search file contents with a regular expression. Uses ripgrep when available.",
+	description: "Search workspace file contents with a regular expression. Uses ripgrep when available.",
 	readOnly: true,
-	parameters: {
-		type: "object",
-		properties: {
-			pattern: { type: "string" },
-			path: { type: "string" },
-			ignoreCase: { type: "boolean" },
-		},
-		required: ["pattern"],
-	},
+	parameters: { type: "object", properties: { pattern: { type: "string" }, path: { type: "string" }, ignoreCase: { type: "boolean" } }, required: ["pattern"] },
 	summarize: (a) => `grep ${a.pattern}`,
 	async run(args, ctx) {
-		const target = resolve(ctx.cwd, args.path ?? ".")
+		const pattern = requireText(args.pattern, "pattern")
+		const target = await workspacePath(ctx.cwd, args.path ?? ".")
 		const rg = await which("rg")
 		if (rg) {
-			const res = await spawnCapture(
-				rg,
-				[
-					"--line-number",
-					"--no-heading",
-					"--color=never",
-					...(args.ignoreCase ? ["-i"] : []),
-					args.pattern,
-					target,
-				],
-				{ cwd: ctx.cwd, timeoutMs: 60_000 },
-			)
-			if (res.code > 1) return `ripgrep failed: ${res.stderr}`
+			const res = await spawnCapture(rg, ["--line-number", "--no-heading", "--color=never", ...(args.ignoreCase ? ["-i"] : []), "--", pattern, target], { cwd: ctx.cwd, timeoutMs: 60_000 })
+			if (res.timedOut || res.code !== 0 && res.code !== 1) throw new Error(`ripgrep failed: exit=${res.code} ${res.stderr}`)
 			return clip(res.stdout || "(no matches)")
 		}
-		// Fallback: no native engine on this machine.
-		const re = new RegExp(args.pattern, args.ignoreCase ? "i" : "")
-		const files = await listFiles(target)
+		const re = new RegExp(pattern, args.ignoreCase ? "i" : "")
 		const hits: string[] = []
-		for (const file of files) {
-			const text = await readText(file).catch(() => "")
-			text.split(/\r?\n/).forEach((line, index) => {
-				if (re.test(line)) hits.push(`${toPosix(relative(ctx.cwd, file))}:${index + 1}:${line}`)
+		for (const file of await workspaceFiles(ctx.cwd, args.path ?? ".")) {
+			const text = await readText(await workspacePath(ctx.cwd, file))
+			text.split(/\r?\n/).forEach((line, i) => {
+				if (re.test(line)) hits.push(`${toPosix(relative(ctx.cwd, file))}:${i + 1}:${line}`)
 			})
-			if (hits.length > 1000) break
+			if (hits.length > 1000) { hits.push("... [search results truncated]"); break }
 		}
 		return clip(hits.join("\n") || "(no matches)")
 	},
@@ -119,96 +77,82 @@ export const grepFiles: Tool = {
 
 export const writeFile: Tool = {
 	name: "write",
-	description: "Write a file, creating parent directories. Snapshots the previous content first.",
+	description: "Write a workspace file, creating parent directories. Snapshot previous bytes first.",
 	readOnly: false,
-	parameters: {
-		type: "object",
-		properties: { path: { type: "string" }, content: { type: "string" } },
-		required: ["path", "content"],
-	},
-	summarize: (a) => `write ${a.path} (${String(a.content ?? "").length} bytes)`,
+	parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
+	summarize: (a) => `write ${a.path} (${String(a.content ?? "").length} characters)`,
 	async run(args, ctx) {
-		const path = resolve(ctx.cwd, args.path)
+		const content = requireText(args.content, "content")
+		const path = await workspacePath(ctx.cwd, args.path, true)
 		const checkpoint = await ctx.checkpoints.snapshot(path, "write")
 		await ctx.session.append("checkpoint", checkpoint)
-		await writeText(path, args.content)
+		if (await workspacePath(ctx.cwd, args.path, true) !== path) throw new Error("path changed during snapshot")
+		await writeText(path, content)
 		return `wrote ${args.path} (checkpoint #${checkpoint.seq})`
 	},
 }
 
 export const editFile: Tool = {
 	name: "edit",
-	description: "Replace an exact string in a file. The old string must appear exactly once.",
+	description: "Replace exact literal text inside a workspace file. A failed match is a failed tool call.",
 	readOnly: false,
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string" },
-			oldString: { type: "string" },
-			newString: { type: "string" },
-			replaceAll: { type: "boolean" },
-		},
-		required: ["path", "oldString", "newString"],
-	},
+	parameters: { type: "object", properties: { path: { type: "string" }, oldString: { type: "string" }, newString: { type: "string" }, replaceAll: { type: "boolean" } }, required: ["path", "oldString", "newString"] },
 	summarize: (a) => `edit ${a.path}`,
 	async run(args, ctx) {
-		const path = resolve(ctx.cwd, args.path)
+		const oldString = requireText(args.oldString, "oldString")
+		const newString = requireText(args.newString, "newString")
+		if (!oldString) throw new Error("oldString must not be empty")
+		const path = await workspacePath(ctx.cwd, args.path, true)
 		const before = await readText(path)
-		const occurrences = before.split(args.oldString).length - 1
-		if (occurrences === 0) return "error: oldString not found"
-		if (occurrences > 1 && !args.replaceAll)
-			return `error: oldString appears ${occurrences} times; pass replaceAll or add context`
+		const occurrences = before.split(oldString).length - 1
+		if (occurrences === 0) throw new Error("oldString not found")
+		if (occurrences > 1 && !args.replaceAll) throw new Error(`oldString appears ${occurrences} times; pass replaceAll or add context`)
 		const checkpoint = await ctx.checkpoints.snapshot(path, "edit")
 		await ctx.session.append("checkpoint", checkpoint)
-		const after = args.replaceAll
-			? before.split(args.oldString).join(args.newString)
-			: before.replace(args.oldString, args.newString)
+		if (await workspacePath(ctx.cwd, args.path, true) !== path || await readText(path) !== before)
+			throw new Error("file changed during snapshot; refusing stale edit")
+		const after = args.replaceAll ? before.split(oldString).join(newString) : before.replace(oldString, () => newString)
 		await writeText(path, after)
-		return `edited ${args.path} (${occurrences} occurrence(s), checkpoint #${checkpoint.seq})`
+		return `edited ${args.path} (${args.replaceAll ? occurrences : 1} occurrence(s), checkpoint #${checkpoint.seq})`
 	},
 }
 
 export const bash: Tool = {
 	name: "bash",
-	description:
-		"Run a shell command in the working directory and return its combined output. Uses bash or sh on Linux and macOS, cmd.exe or PowerShell on Windows.",
+	description: "Run a shell command. Nonzero exits and timeouts fail. Shell is NOT a filesystem sandbox.",
 	readOnly: false,
-	// A command can reach anything: network, package registries, deploys.
 	irreversible: true,
-	parameters: {
-		type: "object",
-		properties: { command: { type: "string" }, timeoutMs: { type: "number" } },
-		required: ["command"],
-	},
+	parameters: { type: "object", properties: { command: { type: "string" }, timeoutMs: { type: "number" } }, required: ["command"] },
 	summarize: (a) => `$ ${a.command}`,
 	async run(args, ctx) {
-		const plan = shellPlan(args.command)
-		const res = await spawnCapture(plan.file, plan.args, {
-			cwd: ctx.cwd,
-			timeoutMs: args.timeoutMs ?? 120_000,
-		})
-		const head = `exit=${res.code} shell=${plan.shell}${res.timedOut ? " (timed out)" : ""}`
-		return clip(`${head}\n${res.stdout}${res.stderr ? `\n[stderr]\n${res.stderr}` : ""}`)
+		const timeoutMs = args.timeoutMs ?? 120_000
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000)
+			throw new Error("timeoutMs must be between 1 and 120000")
+		const plan = shellPlan(requireText(args.command, "command"))
+		const res = await spawnCapture(plan.file, plan.args, { cwd: ctx.cwd, timeoutMs })
+		const output = clip(`exit=${res.code} shell=${plan.shell}${res.timedOut ? " (timed out)" : ""}\n${res.stdout}${res.stderr ? `\n[stderr]\n${res.stderr}` : ""}`)
+		if (res.code !== 0 || res.timedOut) throw new Error(output)
+		return output
 	},
 }
 
-/** Delete a path. Present so undo has a counterpart the model can name. */
 export const removePath: Tool = {
 	name: "rm",
-	description: "Delete a file or directory. Snapshots files first; directories are not recoverable.",
+	description: "Delete one workspace file after checkpointing. Directory deletion is refused.",
 	readOnly: false,
 	irreversible: true,
-	parameters: {
-		type: "object",
-		properties: { path: { type: "string" } },
-		required: ["path"],
-	},
+	parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
 	summarize: (a) => `rm ${a.path}`,
 	async run(args, ctx) {
-		const path = resolve(ctx.cwd, args.path)
+		const path = await workspacePath(ctx.cwd, args.path, true)
 		const checkpoint = await ctx.checkpoints.snapshot(path, "rm")
+		if (!checkpoint.existed) throw new Error("file does not exist")
 		await ctx.session.append("checkpoint", checkpoint)
-		await remove(path)
+		if (await workspacePath(ctx.cwd, args.path, true) !== path) throw new Error("path changed during snapshot")
+		// Explicitly non-recursive: do not let a concurrent directory replacement
+		// turn a single-file operation into a recursive delete.
+		const { unlink } = await import("node:fs/promises")
+		await unlink(path)
 		return `removed ${args.path} (checkpoint #${checkpoint.seq})`
 	},
 }

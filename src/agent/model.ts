@@ -309,47 +309,58 @@ export class Model {
 		const reader = res.body.getReader()
 		const decoder = new TextDecoder()
 		let buffer = ""
-		while (true) {
-			const { done, value } = await reader.read()
-			if (done) break
-			buffer += decoder.decode(value, { stream: true })
-			const lines = buffer.split("\n")
-			buffer = lines.pop() ?? ""
-			for (const raw of lines) {
-				const line = raw.trim()
-				if (!line.startsWith("data:")) continue
-				const payload = line.slice(5).trim()
-				if (payload === "[DONE]") continue
-				let chunk: any
-				try {
-					chunk = JSON.parse(payload)
-				} catch {
-					continue
+		let drained = false
+		try {
+			readStream: while (true) {
+				const { done, value } = await reader.read()
+				if (done) {
+					drained = true
+					break
 				}
-				const choice = chunk.choices?.[0]
-				if (!choice) continue
-				const delta = choice.delta ?? {}
-				if (typeof delta.content === "string" && delta.content) {
-					text += delta.content
-					onToken?.(delta.content)
-				}
-				for (const tc of delta.tool_calls ?? []) {
-					const slot = tc.index ?? 0
-					const current = partial.get(slot) ?? { id: tc.id ?? `call_${slot}`, name: "", arguments: "" }
-					if (tc.id) current.id = tc.id
-					if (tc.function?.name) current.name += tc.function.name
-					if (tc.function?.arguments) current.arguments += tc.function.arguments
-					partial.set(slot, current)
-				}
-				if (choice.finish_reason) {
-					stopReason =
-						choice.finish_reason === "tool_calls"
-							? "tool_calls"
-							: choice.finish_reason === "length"
-								? "length"
-								: "stop"
+				buffer += decoder.decode(value, { stream: true })
+				const lines = buffer.split("\n")
+				buffer = lines.pop() ?? ""
+				for (const raw of lines) {
+					const line = raw.trim()
+					if (!line.startsWith("data:")) continue
+					const payload = line.slice(5).trim()
+					if (payload === "[DONE]") break readStream
+					let chunk: any
+					try {
+						chunk = JSON.parse(payload)
+					} catch {
+						continue
+					}
+					const choice = chunk.choices?.[0]
+					if (!choice) continue
+					const delta = choice.delta ?? {}
+					if (typeof delta.content === "string" && delta.content) {
+						text += delta.content
+						onToken?.(delta.content)
+					}
+					for (const tc of delta.tool_calls ?? []) {
+						const slot = tc.index ?? 0
+						const current = partial.get(slot) ?? { id: tc.id ?? `call_${slot}`, name: "", arguments: "" }
+						if (tc.id) current.id = tc.id
+						if (tc.function?.name) current.name += tc.function.name
+						if (tc.function?.arguments) current.arguments += tc.function.arguments
+						partial.set(slot, current)
+					}
+					if (choice.finish_reason) {
+						stopReason =
+							choice.finish_reason === "tool_calls"
+								? "tool_calls"
+								: choice.finish_reason === "length"
+									? "length"
+									: "stop"
+					}
 				}
 			}
+		} finally {
+			// DONE is the protocol boundary, even if the HTTP connection stays open.
+			// Consumer/transport failures must also release the response body.
+			if (!drained) await reader.cancel().catch(() => {})
+			reader.releaseLock()
 		}
 
 		const toolCalls = [...partial.values()].filter((c) => c.name)

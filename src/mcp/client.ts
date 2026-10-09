@@ -27,13 +27,6 @@ type Pending = {
 	reject: (error: Error) => void
 	timer: ReturnType<typeof setTimeout>
 	method: string
-	/**
-	 * True only while a real consumer is forwarding this call's settlement.
-	 * The inert unhandled-rejection guard installed by request() swallows every
-	 * rejection unless `owned` is set, so abandoned fire-and-forget calls can
-	 * never crash the process while awaited calls still surface their errors.
-	 */
-	owned?: boolean
 }
 
 export type McpToolInfo = {
@@ -155,6 +148,7 @@ export class McpClient {
 	 *  exercised without spawning a real MCP server. */
 	setProcForTest(proc: unknown): void {
 		this.proc = proc as ChildProcess
+		this.exitReason = null
 	}
 
 	/** Test seam: read the pending-call table (keys are stringified JSON-RPC ids). */
@@ -162,43 +156,37 @@ export class McpClient {
 		return [...this.pending.keys()]
 	}
 
-	async request(method: string, params: unknown, timeoutMs = 30_000): Promise<any> {
-		if (this.exitReason) throw new Error(`${this.serverName}: ${method}: ${this.exitReason}`)
+	request(method: string, params: unknown, timeoutMs = 30_000): Promise<any> {
+		// Return the guarded promise itself; an async wrapper would create a
+		// second, unguarded rejection for fire-and-forget callers.
+		if (this.exitReason) {
+			const failed = Promise.reject(new Error(`${this.serverName}: ${method}: ${this.exitReason}`))
+			void failed.catch(() => undefined)
+			return failed
+		}
 		const id = this.nextId++
 		const key = String(id)
-		const promise = new Promise<unknown>((resolvePromise, reject) => {
+		const promise = new Promise<unknown>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(key)
 				reject(new Error(`${this.serverName}: ${method} timed out after ${timeoutMs}ms`))
 			}, timeoutMs)
-			this.pending.set(key, { resolve: resolvePromise, reject, timer, method })
+			this.pending.set(key, { resolve, reject, timer, method })
 		})
-		this.write({ jsonrpc: "2.0", id, method, params })
-		// Fire-and-forget guard. An abandoned request that later rejects (server
-		// dies, stop(), timeout) must not raise unhandledRejection and kill the
-		// process. The returned thenable marks the call "owned" only for the
-		// microtask in which it forwards the settlement to a real consumer, so
-		// awaiting callers still observe the error; every other rejection is
-		// swallowed by the inert catch below.
-		const entry = this.pending.get(key)!
-		void promise.catch(() => {
-			if (!entry.owned) return
-			throw new Error(`${this.serverName}: internal settle race`)
-		})
-		return new Promise<unknown>((resolveOuter, rejectOuter) => {
-			void promise.then(
-				(value) => {
-					entry.owned = true
-					resolveOuter(value)
-				},
-				(error: Error) => {
-					entry.owned = true
-					rejectOuter(error)
-				},
-			)
-		}).finally(() => {
-			entry.owned = false
-		})
+		// This handles abandoned calls without changing rejection for consumers
+		// that await or attach their own .catch() to the same promise.
+		void promise.catch(() => undefined)
+		try {
+			this.write({ jsonrpc: "2.0", id, method, params })
+		} catch (error) {
+			const pending = this.pending.get(key)
+			if (pending) {
+				this.pending.delete(key)
+				clearTimeout(pending.timer)
+				pending.reject(error instanceof Error ? error : new Error(String(error)))
+			}
+		}
+		return promise
 	}
 
 	async catalog(): Promise<McpToolInfo[]> {

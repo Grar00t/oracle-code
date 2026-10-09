@@ -63,6 +63,7 @@ describe("JSON-RPC id handling", () => {
 		const p1 = client.request("tools/list", {})
 		client.stop()
 		await expect(p1).rejects.toThrow(/client stopped/)
+		client.setProcForTest({ stdin: { write: (_text: string) => undefined } })
 		const p2 = client.request("tools/list", {})
 		// The echoed id of the second request must differ from the first ("1").
 		const id = firstPendingId(client)
@@ -76,6 +77,8 @@ describe("tool execution errors surface as failures", () => {
 	test("isError:true rejects the call instead of returning ok text", async () => {
 		const { client } = makeClient()
 		const callPromise = client.call("boom", {})
+		await Promise.resolve() // call() first awaits start()
+		expect(firstPendingId(client)).toBeDefined()
 		client.consume(
 			JSON.stringify({
 				jsonrpc: "2.0",
@@ -89,6 +92,8 @@ describe("tool execution errors surface as failures", () => {
 	test("isError absent resolves normally", async () => {
 		const { client } = makeClient()
 		const callPromise = client.call("fine", {})
+		await Promise.resolve() // call() first awaits start()
+		expect(firstPendingId(client)).toBeDefined()
 		client.consume(
 			JSON.stringify({
 				jsonrpc: "2.0",
@@ -117,7 +122,7 @@ describe("transport robustness", () => {
 		for (let i = 0; i < huge.length; i += 1024 * 1024) client.consume(huge.slice(i, i + 1024 * 1024))
 		await p
 		expect(rejected).toBeInstanceOf(Error)
-		expect(String(rejected?.message)).toContain("line limit exceeded")
+		expect(String(rejected)).toContain("line limit exceeded")
 		expect(client.inFlight()).toBe(0)
 	})
 
